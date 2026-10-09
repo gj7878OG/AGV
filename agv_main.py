@@ -2,16 +2,19 @@
 """
 AGV Main Brain — Unified Control System
 ========================================
-Runs BOTH LiDAR obstacle avoidance AND camera line following
-on Jetson Nano, with a single UART connection to STM32.
+Runs OpenCV camera line following as PRIMARY control
+with LiDAR as a SAFETY-ONLY backup on Jetson Nano.
 
-Priority Logic:
-  1. LiDAR STOP  → Emergency stop  (highest priority)
-  2. LiDAR SLOW  → Slow forward    (overrides camera steering)
-  3. Camera LEFT  → Turn left       (line following)
-  4. Camera RIGHT → Turn right      (line following)
-  5. Camera CENTER → Full forward   (line following)
-  6. No line      → Stop            (safety fallback)
+Control Logic:
+  PRIMARY (Camera — OpenCV):
+    - Camera detects yellow line → decides L / R / F / S
+    - This is the main brain of the AGV
+
+  SAFETY ONLY (LiDAR):
+    - LiDAR STOP  → Emergency stop ONLY if obstacle < 1.2m
+    - LiDAR SLOW  → Reduce speed only when going straight (F→W)
+    - LiDAR does NOT override camera steering (L/R)
+    - If no obstacle → camera has full control
 
 Wiring:
   RPLIDAR A1    → Jetson Nano USB (/dev/ttyUSB0)
@@ -270,31 +273,36 @@ def run_agv():
                         cv2.circle(output, (cx, cy), 10, (0, 0, 255), -1)
                         cv2.line(output, (center_x, 0), (center_x, frame.shape[0]), (255, 0, 0), 2)
 
-            # ─────────────────────────────────
-            #  PRIORITY DECISION ENGINE
-            # ─────────────────────────────────
-            #  LiDAR STOP  → 'S' (highest)
-            #  LiDAR SLOW  → 'W' (override camera)
-            #  Camera cmd  → 'L'/'R'/'F'/'S'
-            # ─────────────────────────────────
+            # ─────────────────────────────────────────────
+            #  DECISION ENGINE
+            #  PRIMARY:  Camera (OpenCV yellow line following)
+            #  SAFETY:   LiDAR (emergency stop only)
+            # ─────────────────────────────────────────────
+            #  Camera decides direction: L / R / F / S
+            #  LiDAR only overrides if obstacle < 1.2m
+            # ─────────────────────────────────────────────
 
+            # Camera is ALWAYS the primary decision maker
+            final_cmd = camera_cmd
+            status_text = f"Line: {direction}"
+            status_color = (0, 255, 0)  # Green
+
+            # LiDAR safety override — ONLY when about to crash
             if obstacle_status == 'STOP':
+                # Emergency: obstacle too close, override everything
                 final_cmd = 'S'
-                status_text = f"EMERGENCY STOP | Obstacle {obstacle_dist/1000:.2f}m"
+                status_text = f"⚠ SAFETY STOP | Obstacle {obstacle_dist/1000:.2f}m"
                 status_color = (0, 0, 255)  # Red
-            elif obstacle_status == 'SLOW':
+            elif obstacle_status == 'SLOW' and camera_cmd == 'F':
+                # Obstacle ahead but not critical — camera still steers, just slower
                 final_cmd = 'W'
-                status_text = f"SLOW | Obstacle {obstacle_dist/1000:.2f}m"
+                status_text = f"Line: {direction} | Obstacle {obstacle_dist/1000:.2f}m (slowing)"
                 status_color = (0, 255, 255)  # Yellow
-            else:
-                final_cmd = camera_cmd
-                status_text = f"Line: {direction}"
-                status_color = (0, 255, 0)  # Green
 
             # Send command to STM32 (only on change)
             if final_cmd != last_cmd:
                 send_to_stm32(stm, final_cmd.encode())
-                print(f"  → STM32: '{final_cmd}' | LiDAR: {obstacle_status} | Camera: {direction}")
+                print(f"  → STM32: '{final_cmd}' | Camera: {direction} | LiDAR: {obstacle_status}")
                 last_cmd = final_cmd
 
             # ── Draw HUD on camera feed ──
