@@ -610,6 +610,7 @@ def run_agv():
                 'lidar_error': lidar_error,
                 'lidar_distance_mm': float(obstacle_dist),
                 'final_command': final_cmd,
+                'decision_reason': status_text,
             }, frame=output, log_message=log_message)
 
             if SHOW_WINDOW:

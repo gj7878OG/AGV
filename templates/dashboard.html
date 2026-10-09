@@ -48,14 +48,14 @@
         <h2>Vehicle state</h2>
         <div class="stats">
           <div class="stat"><span class="label">Camera direction</span><span id="direction" class="value">—</span></div>
-          <div class="stat"><span class="label">Camera command</span><span id="camera-command" class="value">—</span></div>
           <div class="stat"><span class="label">Camera connection</span><span id="camera-link" class="value device">—</span></div>
           <div class="stat"><span class="label">LiDAR state</span><span id="lidar" class="value">—</span></div>
           <div class="stat"><span class="label">LiDAR connection</span><span id="lidar-link" class="value device">—</span></div>
           <div class="stat"><span class="label">Obstacle distance</span><span id="distance" class="value">—</span></div>
-          <div class="stat"><span class="label">STM32 command</span><span id="command" class="value">—</span></div>
           <div class="stat"><span class="label">STM32 serial link</span><span id="stm32-link" class="value device">—</span></div>
-          <div class="stat"><span class="label">Control process</span><span id="running" class="value">—</span></div>
+          
+          <div class="stat" style="background: #1e3a8a;"><span class="label" style="color: #bfdbfe;">Final Motor Command</span><span id="command" class="value" style="color: white; font-weight: bold;">—</span></div>
+          <div class="stat" style="background: #1e3a8a;"><span class="label" style="color: #bfdbfe;">Active Decision (Why it's moving)</span><span id="decision-reason" class="value" style="color: white; font-size: 0.95rem;">—</span></div>
         </div>
         <p class="hint">STM32 status reflects serial port and command-write health; the current firmware does not send an acknowledgment.</p>
       </section>
@@ -100,7 +100,8 @@
         setConnection('stm32-link', data.stm32_connected, fresh, typeof data.stm32_connected === 'boolean');
         setText('distance', data.lidar_distance_mm > 0 ? `${Math.round(data.lidar_distance_mm)} mm` : '—');
         setText('command', data.final_command);
-        setText('running', data.running ? 'RUNNING' : 'STOPPED');
+        setText('decision-reason', data.decision_reason || '—');
+        
         for (const entry of data.logs || []) {
           const row = document.createElement('li');
           const stamp = new Date(entry.timestamp * 1000).toLocaleTimeString();
