@@ -1,5 +1,12 @@
 # Autonomous Guided Vehicle (AGV) --- Jetson Nano Computer Vision Platform
 
+> **Implementation status:** `agv_main.py` is the current unified prototype.
+> It contains camera line detection, LiDAR safety logic, and STM32 serial
+> commands. Hardware validation is a separate step; the presence of code does
+> not mean the integrated system has been tested on the vehicle. The browser
+> dashboard is planned in [WEB_DASHBOARD_PLAN.md](WEB_DASHBOARD_PLAN.md) and is
+> not implemented yet.
+
 ## 1. Project Overview
 
 This project is the development of a **camera-guided Autonomous Guided
@@ -494,13 +501,78 @@ single sensor.
 
 # 12. Current Project Files
 
-The current project directory contains:
+The current project directory includes:
 
 ``` text
 agv/
+├── agv_main.py
+├── main.c
+├── main.h
 ├── camera_test.py
-└── yellow_line.py
+├── lidar_collision_monitor.py
+├── manual_motor_test.py
+├── dashboard.py
+├── requirements-dashboard.txt
+├── templates/dashboard.html
+├── yellow_line.py
+└── WEB_DASHBOARD_PLAN.md
 ```
+
+`agv_main.py` is the unified camera + LiDAR + STM32 prototype. The other
+scripts are standalone camera, line-following, and LiDAR experiments. The
+read-only dashboard is implemented in `dashboard.py` and `templates/`.
+
+## `agv_main.py`
+
+Purpose:
+
+-   Detect and follow the yellow line using the IMX219 camera and OpenCV.
+-   Use LiDAR readings for stop and slow safety behavior.
+-   Send the final command to the STM32 over serial.
+
+Current status:
+
+**Implemented in source; end-to-end Jetson and vehicle validation must be
+confirmed separately.**
+
+### Optional read-only web dashboard
+
+The dashboard runs as a separate process and reads status and annotated frames
+published by `agv_main.py`. It does not access the camera or send motor
+commands. The activity panel records startup/shutdown, sensor connection
+problems, camera direction changes, LiDAR state/distance-band changes, and
+final command changes. The state panel shows whether camera capture, LiDAR, and
+the STM32 serial link are connected. It keeps the latest 500 events, newest
+first.
+
+Create an isolated dashboard environment and install Flask. On older Jetson
+Python releases, upgrade the packaging tools first so pip can select the ARM
+wheels:
+
+```bash
+python3 -m venv .venv-dashboard
+. .venv-dashboard/bin/activate
+python -m pip install --upgrade 'pip<22' 'setuptools<60' wheel
+python -m pip install -r requirements-dashboard.txt
+```
+
+Start the control program in one terminal:
+
+```bash
+python3 agv_main.py
+```
+
+Start the dashboard in another terminal as the same user:
+
+```bash
+. .venv-dashboard/bin/activate
+python dashboard.py
+```
+
+Open `http://<jetson-lan-ip>:5000` from a device on the same Wi-Fi network. Both
+processes use `/tmp/agv-dashboard` by default; set `AGV_DASHBOARD_DIR` in both
+if using another directory. The dashboard is read-only and intended for a
+trusted local network.
 
 ## `camera_test.py`
 
@@ -512,8 +584,9 @@ Purpose:
 
 Current status:
 
-**Created and executed, but camera capture is currently failing at the
-Jetson Argus/IMX219 initialization stage.**
+**Created. An earlier bring-up attempt recorded an Argus/IMX219 capture
+failure; recheck the camera on the current Jetson before relying on that
+diagnosis.**
 
 ------------------------------------------------------------------------
 
@@ -533,7 +606,7 @@ reliable camera capture is restored.**
 
 ------------------------------------------------------------------------
 
-# 13. Current Camera Status
+# 13. Camera Bring-Up Notes (Historical; Recheck)
 
 The Linux device layer detects the camera:
 
@@ -560,7 +633,7 @@ Argus CaptureSession            FAILING
 
 ------------------------------------------------------------------------
 
-# 14. Current Camera Error
+# 14. Camera Error Recorded During Earlier Bring-Up
 
 The native Jetson GStreamer pipeline was tested:
 
@@ -1049,6 +1122,11 @@ AGV movement
 
 As of the current development stage:
 
+The camera diagnostics below are historical notes from an earlier bring-up
+attempt. Recheck them on the current Jetson before treating them as the current
+hardware state. The repository contains the unified control code, but this
+README does not record a successful end-to-end hardware run.
+
   -----------------------------------------------------------------------
   Component                           Status
   ----------------------------------- -----------------------------------
@@ -1071,13 +1149,14 @@ As of the current development stage:
 
   Yellow-line script                  Created
 
-  Yellow-line live test               Pending camera recovery
+  Yellow-line live test               Hardware validation not recorded here
+
+  Unified camera/LiDAR/STM32 code      Present in `agv_main.py`; hardware
+                                      validation not established by this doc
+
+  Web dashboard                       Planned; see `WEB_DASHBOARD_PLAN.md`
 
   Human detection                     Planned
-
-  LiDAR integration                   Planned
-
-  Motor integration                   Pending
 
   Full autonomous AGV                 Pending
   -----------------------------------------------------------------------
