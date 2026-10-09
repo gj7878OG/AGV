@@ -345,27 +345,31 @@ def run_agv():
         'final_command': 'S',
     }, log_message='AGV control process starting')
 
-    # 1. Connect to STM32
-    stm = connect_stm32()
-    if not stm:
-        print("\n⛔ Cannot proceed without STM32. Check wiring.")
+    # 1. Open the camera first. Its preview and telemetry remain available
+    # even when the motor controller or LiDAR is disconnected.
+    print("\n[Camera] Opening IMX219...")
+    cap = cv2.VideoCapture(CAMERA_PIPELINE, cv2.CAP_GSTREAMER)
+    if not cap.isOpened():
+        print("[Camera] ❌ Could not open IMX219")
         publish_telemetry({
-            'running': False,
-            'camera_connected': False,
-            'stm32_connected': False,
-            'camera_direction': 'UNAVAILABLE',
-            'camera_command': 'S',
-            'lidar_status': 'CLEAR',
-            'lidar_connected': False,
-            'lidar_error': None,
-            'lidar_distance_mm': 0,
-            'final_command': 'S',
-        }, log_message='STM32 unavailable; AGV did not start')
+            'running': False, 'camera_connected': False,
+            'stm32_connected': False, 'camera_direction': 'UNAVAILABLE',
+            'camera_command': 'S', 'lidar_status': 'UNKNOWN',
+            'lidar_connected': False, 'lidar_error': None,
+            'lidar_distance_mm': 0, 'final_command': 'S',
+        }, log_message='Camera unavailable')
         stop_telemetry_writer()
         return
+    print("[Camera] ✅ IMX219 opened at 1280x720 @30fps")
 
-    # Safety: stop motors
-    stm32_connected = send_to_stm32(stm, b'S')
+    # Connect to the STM32, but keep the camera running without it.
+    stm = connect_stm32()
+    stm32_connected = bool(stm and send_to_stm32(stm, b'S'))
+    if not stm32_connected:
+        print("[STM32] Unavailable; camera-only mode, motor command held at S.")
+        if stm:
+            stm.close()
+            stm = None
     publish_telemetry({
         'running': False,
         'camera_connected': False,
@@ -382,48 +386,14 @@ def run_agv():
         else 'STM32 command write failed during startup'
     ))
 
-    # 2. Start LiDAR in background thread
+    # 2. Start LiDAR in the background; do not block camera capture on it.
     lidar_t = threading.Thread(target=lidar_thread_func, daemon=True)
     lidar_t.start()
-    time.sleep(2)  # Let LiDAR initialize
-
-    # 3. Open camera
-    print("\n[Camera] Opening IMX219...")
-    cap = cv2.VideoCapture(CAMERA_PIPELINE, cv2.CAP_GSTREAMER)
-
-    if not cap.isOpened():
-        print("[Camera] ❌ Could not open IMX219")
-        send_to_stm32(stm, b'S')
-        stm.close()
-        with lidar_lock:
-            lidar_state['running'] = False
-        lidar_t.join(timeout=3)
-        with lidar_lock:
-            lidar_connected = lidar_state['connected']
-            lidar_status = lidar_state['status']
-            lidar_distance = lidar_state['distance']
-            lidar_error = lidar_state['error']
-        publish_telemetry({
-            'running': False,
-            'camera_connected': False,
-            'stm32_connected': False,
-            'camera_direction': 'UNAVAILABLE',
-            'camera_command': 'S',
-            'lidar_status': lidar_status,
-            'lidar_connected': lidar_connected,
-            'lidar_error': lidar_error,
-            'lidar_distance_mm': float(lidar_distance),
-            'final_command': 'S',
-        }, log_message='Camera unavailable; AGV did not start')
-        stop_telemetry_writer()
-        return
-
-    print("[Camera] ✅ IMX219 opened at 1280x720 @30fps")
     camera_connected = True
     if SHOW_WINDOW:
-        print("\n🚀 AGV RUNNING — Press Q in camera window to stop\n")
+        print("\n📷 Camera running — Press Q in camera window to stop\n")
     else:
-        print("\n🚀 AGV RUNNING headlessly — Press Ctrl+C to stop\n")
+        print("\n📷 Camera running headlessly — Press Ctrl+C to stop\n")
 
     last_cmd = None
     last_camera_state = None
@@ -520,8 +490,16 @@ def run_agv():
                 status_text = f"Line: {direction} | Obstacle {obstacle_dist/1000:.2f}m (slowing)"
                 status_color = (0, 255, 255)  # Yellow
 
+            # Camera preview stays live, while motion remains stopped until
+            # both the STM32 and LiDAR safety sensor are available.
+            if not stm32_connected or not lidar_connected:
+                final_cmd = 'S'
+                status_text = ('CAMERA ONLY | STM32 unavailable' if not stm32_connected
+                               else 'CAMERA ONLY | LiDAR unavailable')
+                status_color = (0, 0, 255)
+
             # Send command to STM32 (only on change)
-            if final_cmd != last_cmd:
+            if stm and final_cmd != last_cmd:
                 stm32_connected = send_to_stm32(stm, final_cmd.encode())
                 log_message = (
                     f"STM32: {final_cmd} | Camera: {direction} | "
@@ -625,8 +603,11 @@ def run_agv():
     finally:
         # Safety shutdown
         print("\n🛑 Shutting down AGV...")
-        send_to_stm32(stm, b'S')
-        print("   Motors stopped.")
+        if stm:
+            send_to_stm32(stm, b'S')
+            print("   Motors stopped.")
+        else:
+            print("   No STM32 link; no motor command was sent.")
 
         with lidar_lock:
             lidar_state['running'] = False
@@ -638,8 +619,9 @@ def run_agv():
             cv2.destroyAllWindows()
         print("   Camera released.")
 
-        stm.close()
-        print("   STM32 serial closed.")
+        if stm:
+            stm.close()
+            print("   STM32 serial closed.")
         print("\n✅ AGV shutdown complete.")
         with lidar_lock:
             lidar_connected = lidar_state['connected']
@@ -660,8 +642,8 @@ def run_agv():
         }, log_message=[
             'Camera disconnected (capture closed)',
             'LiDAR connected' if lidar_connected else 'LiDAR disconnected',
-            'STM32 serial link disconnected (port closed)',
-            f'AGV stopped ({stop_reason}); STM32 stop command sent',
+            'STM32 serial link disconnected (port closed)' if stm else 'STM32 unavailable; camera stopped',
+            f'Camera stopped ({stop_reason})',
         ])
         stop_telemetry_writer()
 
