@@ -42,44 +42,37 @@ import time
 import math
 import threading
 import json
+import logging
 import os
 import tempfile
 from collections import deque
 from rplidar import RPLidar, RPLidarException
 
-# ─────────────────────────────────────────────
-#  CONFIGURATION
-# ─────────────────────────────────────────────
-
-# Serial ports
-LIDAR_PORT = '/dev/ttyUSB0'     # RPLIDAR A1 USB
-STM32_PORT = '/dev/ttyTHS1'     # Jetson UART1 to STM32
-BAUD_RATE  = 115200
-
-# LiDAR collision zones (millimeters)
-AGV_HALF_WIDTH = 350            # Corridor half-width (700mm total)
-STOP_DISTANCE  = 1200           # Emergency stop zone (< 1.2m)
-SLOW_DISTANCE  = 2500           # Slow-down zone (1.2m - 2.5m)
-
-# Camera steering
-STEER_DEADZONE = 80             # Pixels from center before steering
-TELEMETRY_DIR = os.environ.get('AGV_DASHBOARD_DIR', '/tmp/agv-dashboard')
-SHOW_WINDOW = os.environ.get(
-    'AGV_SHOW_WINDOW', '1' if os.environ.get('DISPLAY') else '0'
-).lower() in ('1', 'true', 'yes', 'on')
-LOG_LIMIT = 500
-
-# GStreamer pipeline for IMX219
-CAMERA_PIPELINE = (
-    "nvarguscamerasrc sensor-id=0 ! "
-    "video/x-raw(memory:NVMM), width=1280, height=720, "
-    "format=NV12, framerate=30/1 ! "
-    "nvvidconv ! "
-    "video/x-raw, format=BGRx ! "
-    "videoconvert ! "
-    "video/x-raw, format=BGR ! "
-    "appsink"
+from config import (
+    LIDAR_PORT, STM32_PORT, BAUD_RATE,
+    AGV_HALF_WIDTH, STOP_DISTANCE, SLOW_DISTANCE,
+    STEER_DEADZONE, MIN_CONTOUR_AREA, MORPHOLOGY_KERNEL,
+    YELLOW_HSV_LOWER, YELLOW_HSV_UPPER,
+    CAMERA_PIPELINE, TELEMETRY_DIR, LOG_LIMIT, SHOW_WINDOW,
+    STM32_ACK_TIMEOUT_MS, STM32_HEARTBEAT_INTERVAL_MS,
+    ENCODER_TELEMETRY_INTERVAL_MS, LOG_FILE,
 )
+
+# ─────────────────────────────────────────────
+#  LOGGING
+# ─────────────────────────────────────────────
+os.makedirs(os.path.dirname(LOG_FILE) or '.', exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger('agv')
+# Lower volume from third-party libs.
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
 # ─────────────────────────────────────────────
 #  SHARED STATE (thread-safe)
@@ -101,6 +94,20 @@ telemetry_condition = threading.Condition()
 telemetry_pending = None
 telemetry_stopping = False
 telemetry_thread = None
+
+# STM32 reader thread writes these; main loop reads them.
+# `last_ack_monotonic` is updated every time a 'A' byte comes back from
+# the STM32. The main loop compares (now - last_ack_monotonic) against
+# STM32_ACK_TIMEOUT_MS to decide whether to trust the serial link.
+stm32_state = {
+    'last_ack_monotonic': 0.0,
+    'encoder_left': 0,
+    'encoder_right': 0,
+    'running': True,
+    'connected': False,
+}
+stm32_lock = threading.Lock()
+stm32_reader_thread = None
 
 
 def _atomic_write(path, data):
@@ -168,7 +175,7 @@ def telemetry_writer():
             encoded_state = json.dumps(payload).encode('utf-8')
             _atomic_write(os.path.join(TELEMETRY_DIR, 'status.json'), encoded_state)
         except (OSError, cv2.error, TypeError, ValueError) as exc:
-            print(f"[Dashboard] Telemetry publish failed: {exc}")
+            log.info(f"[Dashboard] Telemetry publish failed: {exc}")
         if frame is not None:
             time.sleep(0.2)
 
@@ -208,16 +215,76 @@ def restore_telemetry_logs():
 #  STM32 SERIAL
 # ─────────────────────────────────────────────
 
+def stm32_reader_thread_func(stm):
+    """Consume ACK ('A') and encoder telemetry ('E' + 4 bytes) from STM32.
+
+    Runs as a daemon; updates shared `stm32_state` under `stm32_lock`.
+    A break in the ACK stream means the STM32 may have stopped responding.
+    """
+    global stm32_state
+    log.info("[STM32] reader thread started")
+    pending_encoder_bytes = 0
+    encoder_buffer = bytearray()
+
+    while True:
+        with stm32_lock:
+            if not stm32_state['running']:
+                break
+
+        try:
+            byte = stm.read(1)
+            if not byte:
+                continue
+
+            if pending_encoder_bytes > 0:
+                encoder_buffer.append(byte[0])
+                pending_encoder_bytes -= 1
+                if pending_encoder_bytes == 0 and len(encoder_buffer) == 4:
+                    left = (encoder_buffer[0] << 8) | encoder_buffer[1]
+                    right = (encoder_buffer[2] << 8) | encoder_buffer[3]
+                    with stm32_lock:
+                        stm32_state['encoder_left'] = left
+                        stm32_state['encoder_right'] = right
+                    encoder_buffer.clear()
+                continue
+
+            if byte == b'A':
+                with stm32_lock:
+                    stm32_state['last_ack_monotonic'] = time.monotonic()
+                    stm32_state['connected'] = True
+            elif byte == b'E':
+                pending_encoder_bytes = 4
+                encoder_buffer.clear()
+
+        except (serial.SerialException, OSError) as exc:
+            log.warning("[STM32] reader disconnected: %s", exc)
+            with stm32_lock:
+                stm32_state['connected'] = False
+            time.sleep(0.5)
+
+    log.info("[STM32] reader thread exiting")
+
+
 def connect_stm32():
-    """Connect to STM32 via UART."""
+    """Connect to STM32 via UART and start the ACK/encoder reader thread."""
+    global stm32_reader_thread
     try:
         stm = serial.Serial(STM32_PORT, BAUD_RATE, timeout=1)
         time.sleep(1)
-        print(f"✅ STM32 connected on {STM32_PORT}")
+        with stm32_lock:
+            stm32_state['running'] = True
+            stm32_state['last_ack_monotonic'] = time.monotonic()
+            stm32_state['connected'] = False
+        stm32_reader_thread = threading.Thread(
+            target=stm32_reader_thread_func, args=(stm,),
+            name='stm32-reader', daemon=True,
+        )
+        stm32_reader_thread.start()
+        log.info("STM32 connected on %s", STM32_PORT)
         return stm
     except Exception as e:
-        print(f"❌ Cannot connect STM32 on {STM32_PORT}: {e}")
-        print("   AGV will not move without STM32 connection.")
+        log.error("Cannot connect STM32 on %s: %s", STM32_PORT, e)
+        log.error("AGV will not move without STM32 connection.")
         return None
 
 
@@ -240,7 +307,7 @@ def lidar_thread_func():
     """Background thread: continuously scan with LiDAR and update shared state."""
     global lidar_state
 
-    print(f"[LiDAR] Connecting to RPLIDAR on {LIDAR_PORT}...")
+    log.info(f"[LiDAR] Connecting to RPLIDAR on {LIDAR_PORT}...")
     lidar = None
 
     try:
@@ -250,8 +317,8 @@ def lidar_thread_func():
         time.sleep(1.5)
 
         info = lidar.get_info()
-        print(f"[LiDAR] ✅ Connected | S/N: {info.get('serialnumber')}")
-        print(f"[LiDAR]    Stop: <{STOP_DISTANCE/1000:.1f}m | Slow: <{SLOW_DISTANCE/1000:.1f}m | Width: {AGV_HALF_WIDTH*2/1000:.1f}m")
+        log.info(f"[LiDAR]  Connected | S/N: {info.get('serialnumber')}")
+        log.info(f"[LiDAR]    Stop: <{STOP_DISTANCE/1000:.1f}m | Slow: <{SLOW_DISTANCE/1000:.1f}m | Width: {AGV_HALF_WIDTH*2/1000:.1f}m")
         with lidar_lock:
             lidar_state['connected'] = True
             lidar_state['error'] = None
@@ -292,12 +359,12 @@ def lidar_thread_func():
                     lidar_state['distance'] = 0
 
     except RPLidarException as e:
-        print(f"[LiDAR] ❌ Error: {e}")
+        log.error(f"[LiDAR]  Error: {e}")
         with lidar_lock:
             lidar_state['connected'] = False
             lidar_state['error'] = str(e)
     except Exception as e:
-        print(f"[LiDAR] ❌ Unexpected error: {e}")
+        log.error(f"[LiDAR]  Unexpected error: {e}")
         with lidar_lock:
             lidar_state['connected'] = False
             lidar_state['error'] = str(e)
@@ -308,7 +375,7 @@ def lidar_thread_func():
             lidar.disconnect()
         with lidar_lock:
             lidar_state['connected'] = False
-        print("[LiDAR] Disconnected.")
+        log.info("[LiDAR] Disconnected.")
 
 
 # ─────────────────────────────────────────────
@@ -321,11 +388,11 @@ def run_agv():
     restore_telemetry_logs()
     start_telemetry_writer()
 
-    print("=" * 55)
-    print("  AGV MAIN BRAIN — Unified Control System")
-    print("  LiDAR + Camera → Jetson Nano → STM32")
-    print("=" * 55)
-    print()
+    log.info("=" * 55)
+    log.info("  AGV MAIN BRAIN — Unified Control System")
+    log.info("  LiDAR + Camera → Jetson Nano → STM32")
+    log.info("=" * 55)
+    log.info()
     with lidar_lock:
         lidar_state['running'] = True
         lidar_state['status'] = 'CLEAR'
@@ -347,10 +414,10 @@ def run_agv():
 
     # 1. Open the camera first. Its preview and telemetry remain available
     # even when the motor controller or LiDAR is disconnected.
-    print("\n[Camera] Opening IMX219...")
+    log.info("\n[Camera] Opening IMX219...")
     cap = cv2.VideoCapture(CAMERA_PIPELINE, cv2.CAP_GSTREAMER)
     if not cap.isOpened():
-        print("[Camera] ❌ Could not open IMX219")
+        log.error("[Camera]  Could not open IMX219")
         publish_telemetry({
             'running': False, 'camera_connected': False,
             'stm32_connected': False, 'camera_direction': 'UNAVAILABLE',
@@ -360,13 +427,13 @@ def run_agv():
         }, log_message='Camera unavailable')
         stop_telemetry_writer()
         return
-    print("[Camera] ✅ IMX219 opened at 1280x720 @30fps")
+    log.info("[Camera]  IMX219 opened at 1280x720 @30fps")
 
     # Connect to the STM32, but keep the camera running without it.
     stm = connect_stm32()
     stm32_connected = bool(stm and send_to_stm32(stm, b'S'))
     if not stm32_connected:
-        print("[STM32] Unavailable; camera-only mode, motor command held at S.")
+        log.info("[STM32] Unavailable; camera-only mode, motor command held at S.")
         if stm:
             stm.close()
             stm = None
@@ -391,9 +458,9 @@ def run_agv():
     lidar_t.start()
     camera_connected = True
     if SHOW_WINDOW:
-        print("\n📷 Camera running — Press Q in camera window to stop\n")
+        log.info("\n Camera running — Press Q in camera window to stop\n")
     else:
-        print("\n📷 Camera running headlessly — Press Ctrl+C to stop\n")
+        log.info("\n Camera running headlessly — Press Ctrl+C to stop\n")
 
     last_cmd = None
     last_camera_state = None
@@ -410,7 +477,7 @@ def run_agv():
             if not ret:
                 camera_connected = False
                 stop_reason = 'camera frame read failed'
-                print('[Camera] ❌ Frame read failed; stopping AGV')
+                log.error('[Camera]  Frame read failed; stopping AGV')
                 break
 
             # ── Read LiDAR state ──
@@ -422,11 +489,11 @@ def run_agv():
 
             # ── Camera: detect yellow line ──
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            lower_yellow = np.array([20, 100, 100])
-            upper_yellow = np.array([35, 255, 255])
+            lower_yellow = np.array(YELLOW_HSV_LOWER)
+            upper_yellow = np.array(YELLOW_HSV_UPPER)
             mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
 
-            kernel = np.ones((5, 5), np.uint8)
+            kernel = np.ones(MORPHOLOGY_KERNEL, np.uint8)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
@@ -443,7 +510,7 @@ def run_agv():
                 contour = max(contours, key=cv2.contourArea)
                 area = cv2.contourArea(contour)
 
-                if area > 500:
+                if area > MIN_CONTOUR_AREA:
                     M = cv2.moments(contour)
                     if M["m00"] != 0:
                         cx = int(M["m10"] / M["m00"])
@@ -498,6 +565,22 @@ def run_agv():
                                else 'CAMERA ONLY | LiDAR unavailable')
                 status_color = (0, 0, 255)
 
+            # STM32 watchdog — force-stop if no ACK within timeout.
+            with stm32_lock:
+                ack_age_ms = (time.monotonic() - stm32_state['last_ack_monotonic']) * 1000.0
+                stm32_link_alive = ack_age_ms <= STM32_ACK_TIMEOUT_MS
+                if not stm32_link_alive and stm32_state['connected']:
+                    stm32_state['connected'] = False
+                encoder_left = stm32_state['encoder_left']
+                encoder_right = stm32_state['encoder_right']
+            if stm and not stm32_link_alive:
+                final_cmd = 'S'
+                status_text = f"STM32 WATCHDOG ({ack_age_ms:.0f} ms since ACK)"
+                status_color = (0, 0, 255)
+                if stm32_connected:
+                    log.warning("STM32 ACK timeout (%.0f ms) — forcing STOP", ack_age_ms)
+                    stm32_connected = False
+
             # Send command to STM32 (only on change)
             if stm and final_cmd != last_cmd:
                 stm32_connected = send_to_stm32(stm, final_cmd.encode())
@@ -505,7 +588,7 @@ def run_agv():
                     f"STM32: {final_cmd} | Camera: {direction} | "
                     f"LiDAR: {obstacle_status} ({obstacle_dist:.0f} mm)"
                 )
-                print(f"  → {log_message}")
+                log.info("  → %s", log_message)
                 last_cmd = final_cmd
             else:
                 log_message = None
@@ -581,6 +664,9 @@ def run_agv():
                 'running': True,
                 'camera_connected': camera_connected,
                 'stm32_connected': stm32_connected,
+                'stm32_ack_age_ms': float(ack_age_ms),
+                'stm32_encoder_left': int(encoder_left),
+                'stm32_encoder_right': int(encoder_right),
                 'camera_direction': direction,
                 'camera_command': camera_cmd,
                 'lidar_status': obstacle_status,
@@ -598,40 +684,53 @@ def run_agv():
                     break
 
     except KeyboardInterrupt:
-        print("\n\nStopping by user...")
+        log.info("Stopping by user...")
         stop_reason = 'stop requested by user'
     finally:
         # Safety shutdown
-        print("\n🛑 Shutting down AGV...")
+        log.warning("Shutting down AGV...")
         if stm:
             send_to_stm32(stm, b'S')
-            print("   Motors stopped.")
+            log.info("   Motors stopped.")
         else:
-            print("   No STM32 link; no motor command was sent.")
+            log.info("   No STM32 link; no motor command was sent.")
 
         with lidar_lock:
             lidar_state['running'] = False
         lidar_t.join(timeout=3)
-        print("   LiDAR thread stopped.")
+        log.info("   LiDAR thread stopped.")
+
+        with stm32_lock:
+            stm32_state['running'] = False
+        if stm32_reader_thread is not None:
+            stm32_reader_thread.join(timeout=2)
+        log.info("   STM32 reader stopped.")
 
         cap.release()
         if SHOW_WINDOW:
             cv2.destroyAllWindows()
-        print("   Camera released.")
+        log.info("   Camera released.")
 
         if stm:
             stm.close()
-            print("   STM32 serial closed.")
-        print("\n✅ AGV shutdown complete.")
+            log.info("   STM32 serial closed.")
+        log.info("AGV shutdown complete.")
         with lidar_lock:
             lidar_connected = lidar_state['connected']
             lidar_status = lidar_state['status']
             lidar_distance = lidar_state['distance']
             lidar_error = lidar_state['error']
+        with stm32_lock:
+            encoder_left = stm32_state['encoder_left']
+            encoder_right = stm32_state['encoder_right']
+            ack_age_ms = (time.monotonic() - stm32_state['last_ack_monotonic']) * 1000.0
         publish_telemetry({
             'running': False,
             'camera_connected': False,
             'stm32_connected': False,
+            'stm32_ack_age_ms': float(ack_age_ms),
+            'stm32_encoder_left': int(encoder_left),
+            'stm32_encoder_right': int(encoder_right),
             'camera_direction': direction if 'direction' in locals() else 'STOPPED',
             'camera_command': camera_cmd if 'camera_cmd' in locals() else 'S',
             'lidar_status': lidar_status,

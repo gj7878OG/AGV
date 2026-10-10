@@ -119,15 +119,36 @@ void Execute_Command(char cmd)
     case 'R':
         AGV_Turn_Right();
         break;
-    case 'X':
-        AGV_Spin();
-        break;
     case 'S':
         Motor_Stop();
         break;
     default:
         break;
     }
+}
+
+/* ── Acknowledge the most recent command back to the Jetson ── */
+static inline void Send_Ack(void)
+{
+    uint8_t ack = 'A';
+    HAL_UART_Transmit(&huart1, &ack, 1, 5);
+}
+
+/* ── Encoder telemetry packet:
+ *     header 'E', then 4 bytes (left count, right count), big-endian int16.
+ *     Lets the Jetson read both motor speeds without a second wire.
+ * ── */
+static inline void Send_Encoder_Telemetry(void)
+{
+    int16_t left  = (int16_t)TIM3->CNT;
+    int16_t right = (int16_t)TIM4->CNT;
+    uint8_t pkt[5];
+    pkt[0] = 'E';
+    pkt[1] = (uint8_t)((uint16_t)left  >> 8);
+    pkt[2] = (uint8_t)((uint16_t)left  & 0xFF);
+    pkt[3] = (uint8_t)((uint16_t)right >> 8);
+    pkt[4] = (uint8_t)((uint16_t)right & 0xFF);
+    HAL_UART_Transmit(&huart1, pkt, sizeof(pkt), 5);
 }
 
 /* USER CODE END 0 */
@@ -155,6 +176,8 @@ int main(void)
     Motor_Stop();
 
     uint8_t rx_byte = 0;
+    uint32_t last_cmd_ms = HAL_GetTick();
+    static uint8_t motors_stopped_by_watchdog = 0;
 
     /* USER CODE END 2 */
 
@@ -162,10 +185,25 @@ int main(void)
     {
         /* USER CODE BEGIN 3 */
 
-        /* Wait for 1 byte from Jetson Nano */
+        /* Block up to 100 ms waiting for a command byte from the Jetson. */
         if (HAL_UART_Receive(&huart1, &rx_byte, 1, 100) == HAL_OK)
         {
             Execute_Command((char)rx_byte);
+            last_cmd_ms = HAL_GetTick();
+            motors_stopped_by_watchdog = 0;
+            Send_Ack();
+
+            /* Piggy-back the encoder snapshot on every ACK so the Jetson
+             * gets a steady stream without us having to schedule it. */
+            Send_Encoder_Telemetry();
+        }
+
+        /* Watchdog — if no command for > 1000 ms, force-stop the motors.
+         * Prevents the AGV from running away if the Jetson stalls. */
+        if ((HAL_GetTick() - last_cmd_ms) > 1000U && !motors_stopped_by_watchdog)
+        {
+            Motor_Stop();
+            motors_stopped_by_watchdog = 1;
         }
 
         /* USER CODE END 3 */

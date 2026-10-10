@@ -509,7 +509,6 @@ agv/
 ├── main.c
 ├── main.h
 ├── camera_test.py
-├── lidar_collision_monitor.py
 ├── manual_motor_test.py
 ├── dashboard.py
 ├── requirements-dashboard.txt
