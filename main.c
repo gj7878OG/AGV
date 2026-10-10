@@ -2,10 +2,25 @@
 /**
  ******************************************************************************
  * @file    : main.c
- * @brief   : AGV 4 Motor — UART Command Control
+ * @brief   : AGV 4 Motor — UART Command + Speed Control + Watchdog
  *            Jetson Nano UART → STM32 → Motors
  *
- * Commands: F=Forward B=Reverse L=TurnLeft R=TurnRight X=Spin S=Stop W=SlowForward
+ * Direction commands:
+ *   F = Forward        B = Reverse       S = Stop
+ *   L = Turn Left      R = Turn Right
+ *   X = Spin clockwise loop (recovery)
+ *   A = Spin anti-clockwise loop (recovery)
+ *
+ * Speed commands (1–5 = 20%–100%, default = 60%):
+ *   1 = 20% (200)      4 = 80% (800)
+ *   2 = 40% (400)      5 = 100% (999)
+ *   3 = 60% (600)
+ *
+ * Telemetry back to Jetson (every acknowledged command):
+ *   'A'         ack of one command
+ *   'E' + 4 B   encoder counts, big-endian int16 × 2 (left, right)
+ *
+ * Watchdog: if no command is received for > 1000 ms, force-stop motors.
  *
  * PIN MAP:
  *   PA0  → TIM2_CH1 PWM → SmartElex 1 (Right)
@@ -35,24 +50,29 @@ static void MX_USART1_UART_Init(void);
 
 /* USER CODE BEGIN 0 */
 
-/* ── Speed Definitions ── */
-#define FULL_SPEED 999
-#define HALF_SPEED 500
-#define TURN_SPEED 600
-#define SLOW_SPEED 300
+/* ── Current speed (default 60%) ── */
+uint16_t current_speed = 600;
+
+/* ── Spin mode flags ── */
+uint8_t spin_cw  = 0;   /* 1 = clockwise spin loop active */
+uint8_t spin_acw = 0;   /* 1 = anti-clockwise spin loop active */
+
+/* Tune for exact 360° on your chassis */
+#define SPIN_TIME_MS   1500   /* time for one full 360° rotation */
+#define SPIN_DELAY_MS  1000   /* delay between rotations */
 
 /* ── Motor Control ── */
 void Motor_Right(uint16_t speed, uint8_t dir)
 {
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0,
-                      dir == 1 ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        dir == 1 ? GPIO_PIN_SET : GPIO_PIN_RESET);
     TIM2->CCR1 = speed;
 }
 
 void Motor_Left(uint16_t speed, uint8_t dir)
 {
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1,
-                      dir == 1 ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        dir == 1 ? GPIO_PIN_SET : GPIO_PIN_RESET);
     TIM2->CCR2 = speed;
 }
 
@@ -65,66 +85,50 @@ void Motor_Stop(void)
 /* ── AGV Movements ── */
 void AGV_Forward(void)
 {
-    Motor_Right(FULL_SPEED, 1);
-    Motor_Left(FULL_SPEED, 1);
-}
-
-void AGV_Slow_Forward(void)
-{
-    Motor_Right(SLOW_SPEED, 1);
-    Motor_Left(SLOW_SPEED, 1);
+    spin_cw = 0; spin_acw = 0;
+    Motor_Right(current_speed, 1);
+    Motor_Left(current_speed, 1);
 }
 
 void AGV_Reverse(void)
 {
-    Motor_Right(FULL_SPEED, 0);
-    Motor_Left(FULL_SPEED, 0);
+    spin_cw = 0; spin_acw = 0;
+    Motor_Right(current_speed, 0);
+    Motor_Left(current_speed, 0);
 }
 
+/* Differential turns — one motor at full, the other at 1/3 */
 void AGV_Turn_Left(void)
 {
-    Motor_Right(TURN_SPEED, 1); /* Right fast */
-    Motor_Left(SLOW_SPEED, 1);  /* Left slow  */
+    spin_cw = 0; spin_acw = 0;
+    Motor_Right(current_speed / 3, 1);   /* Right slow */
+    Motor_Left(current_speed, 1);       /* Left fast  */
 }
 
 void AGV_Turn_Right(void)
 {
-    Motor_Right(SLOW_SPEED, 1); /* Right slow */
-    Motor_Left(TURN_SPEED, 1);  /* Left fast  */
+    spin_cw = 0; spin_acw = 0;
+    Motor_Right(current_speed, 1);      /* Right fast */
+    Motor_Left(current_speed / 3, 1);   /* Left slow  */
 }
 
-void AGV_Spin(void)
+/* ── Spin Logic (one rotation each, with stop check between) ── */
+void AGV_Spin_CW_Once(void)
 {
-    Motor_Right(TURN_SPEED, 1); /* Right forward */
-    Motor_Left(TURN_SPEED, 0);  /* Left reverse  */
+    Motor_Right(current_speed, 1);
+    Motor_Left(current_speed, 0);
+    HAL_Delay(SPIN_TIME_MS);
+    Motor_Stop();
+    HAL_Delay(SPIN_DELAY_MS);
 }
 
-/* ── Execute Command ── */
-void Execute_Command(char cmd)
+void AGV_Spin_ACW_Once(void)
 {
-    switch (cmd)
-    {
-    case 'F':
-        AGV_Forward();
-        break;
-    case 'W':
-        AGV_Slow_Forward();
-        break;
-    case 'B':
-        AGV_Reverse();
-        break;
-    case 'L':
-        AGV_Turn_Left();
-        break;
-    case 'R':
-        AGV_Turn_Right();
-        break;
-    case 'S':
-        Motor_Stop();
-        break;
-    default:
-        break;
-    }
+    Motor_Right(current_speed, 0);
+    Motor_Left(current_speed, 1);
+    HAL_Delay(SPIN_TIME_MS);
+    Motor_Stop();
+    HAL_Delay(SPIN_DELAY_MS);
 }
 
 /* ── Acknowledge the most recent command back to the Jetson ── */
@@ -136,7 +140,6 @@ static inline void Send_Ack(void)
 
 /* ── Encoder telemetry packet:
  *     header 'E', then 4 bytes (left count, right count), big-endian int16.
- *     Lets the Jetson read both motor speeds without a second wire.
  * ── */
 static inline void Send_Encoder_Telemetry(void)
 {
@@ -149,6 +152,30 @@ static inline void Send_Encoder_Telemetry(void)
     pkt[3] = (uint8_t)((uint16_t)right >> 8);
     pkt[4] = (uint8_t)((uint16_t)right & 0xFF);
     HAL_UART_Transmit(&huart1, pkt, sizeof(pkt), 5);
+}
+
+/* ── Execute Command ── */
+void Execute_Command(char cmd)
+{
+    switch (cmd)
+    {
+        case 'F': AGV_Forward();    break;
+        case 'B': AGV_Reverse();    break;
+        case 'L': AGV_Turn_Left();  break;
+        case 'R': AGV_Turn_Right(); break;
+        case 'X': spin_cw = 1; spin_acw = 0; break; /* start CW spin loop */
+        case 'A': spin_acw = 1; spin_cw = 0; break; /* start ACW spin loop */
+        case 'S': spin_cw = 0; spin_acw = 0; Motor_Stop(); break;
+
+        /* Speed commands */
+        case '1': current_speed = 200; break;
+        case '2': current_speed = 400; break;
+        case '3': current_speed = 600; break;
+        case '4': current_speed = 800; break;
+        case '5': current_speed = 999; break;
+
+        default: break;
+    }
 }
 
 /* USER CODE END 0 */
@@ -167,12 +194,10 @@ int main(void)
     MX_USART1_UART_Init();
 
     /* USER CODE BEGIN 2 */
-
     HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
     HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
     HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
     HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
-
     Motor_Stop();
 
     uint8_t rx_byte = 0;
@@ -185,21 +210,48 @@ int main(void)
     {
         /* USER CODE BEGIN 3 */
 
-        /* Block up to 100 ms waiting for a command byte from the Jetson. */
-        if (HAL_UART_Receive(&huart1, &rx_byte, 1, 100) == HAL_OK)
+        /* Check for new command — non-blocking 10 ms poll. */
+        if (HAL_UART_Receive(&huart1, &rx_byte, 1, 10) == HAL_OK)
         {
             Execute_Command((char)rx_byte);
             last_cmd_ms = HAL_GetTick();
             motors_stopped_by_watchdog = 0;
             Send_Ack();
-
-            /* Piggy-back the encoder snapshot on every ACK so the Jetson
-             * gets a steady stream without us having to schedule it. */
             Send_Encoder_Telemetry();
         }
 
+        /* Clockwise spin loop. Each rotation is interruptible by an 'S'. */
+        if (spin_cw)
+        {
+            AGV_Spin_CW_Once();
+            if (HAL_UART_Receive(&huart1, &rx_byte, 1, 10) == HAL_OK)
+            {
+                Execute_Command((char)rx_byte);
+                last_cmd_ms = HAL_GetTick();
+                motors_stopped_by_watchdog = 0;
+                Send_Ack();
+                Send_Encoder_Telemetry();
+            }
+        }
+
+        /* Anti-clockwise spin loop. */
+        if (spin_acw)
+        {
+            AGV_Spin_ACW_Once();
+            if (HAL_UART_Receive(&huart1, &rx_byte, 1, 10) == HAL_OK)
+            {
+                Execute_Command((char)rx_byte);
+                last_cmd_ms = HAL_GetTick();
+                motors_stopped_by_watchdog = 0;
+                Send_Ack();
+                Send_Encoder_Telemetry();
+            }
+        }
+
         /* Watchdog — if no command for > 1000 ms, force-stop the motors.
-         * Prevents the AGV from running away if the Jetson stalls. */
+         * Prevents runaway if the Jetson stalls; spins reset this timer
+         * on every per-rotation UART poll above, so a continuous spin
+         * does NOT trip the watchdog by itself. */
         if ((HAL_GetTick() - last_cmd_ms) > 1000U && !motors_stopped_by_watchdog)
         {
             Motor_Stop();

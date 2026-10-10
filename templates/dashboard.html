@@ -53,11 +53,32 @@
           <div class="stat"><span class="label">LiDAR connection</span><span id="lidar-link" class="value device">—</span></div>
           <div class="stat"><span class="label">Obstacle distance</span><span id="distance" class="value">—</span></div>
           <div class="stat"><span class="label">STM32 serial link</span><span id="stm32-link" class="value device">—</span></div>
-          
+
           <div class="stat" style="background: #1e3a8a;"><span class="label" style="color: #bfdbfe;">Final Motor Command</span><span id="command" class="value" style="color: white; font-weight: bold;">—</span></div>
           <div class="stat" style="background: #1e3a8a;"><span class="label" style="color: #bfdbfe;">Active Decision (Why it's moving)</span><span id="decision-reason" class="value" style="color: white; font-size: 0.95rem;">—</span></div>
         </div>
         <p class="hint">STM32 status reflects serial port and command-write health; the current firmware does not send an acknowledgment.</p>
+      </section>
+      <section class="card">
+        <h2>Sensor probes · startup wiring check</h2>
+        <table id="probes" style="width:100%; border-collapse: collapse; padding: .75rem 1rem; font-size: .85rem;">
+          <thead>
+            <tr style="text-align:left; color:#93a2b8;">
+              <th style="padding: .35rem .5rem;">Device</th>
+              <th style="padding: .35rem .5rem;">Port</th>
+              <th style="padding: .35rem .5rem;">Status</th>
+              <th style="padding: .35rem .5rem;">Latency</th>
+              <th style="padding: .35rem .5rem;">Detail</th>
+            </tr>
+          </thead>
+          <tbody id="probe-rows">
+            <tr><td colspan="5" style="padding:.6rem; color:#93a2b8;">Waiting for first probe…</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <section class="card">
+        <h2>Last error · runtime exceptions</h2>
+        <pre id="last-error" style="margin:0; padding:.9rem 1rem; font:.8rem/1.45 ui-monospace,monospace; white-space:pre-wrap; overflow:auto; max-height:260px; color:#fca5a5;">— none —</pre>
       </section>
       <section class="card log-card">
         <h2>Activity and state changes · newest first</h2>
@@ -82,6 +103,29 @@
         element.className = `value device ${connected ? 'connected' : 'disconnected'}`;
       }
     }
+    function renderProbes(probes) {
+      const tbody = $('probe-rows');
+      if (!probes || !probes.length) {
+        tbody.innerHTML = '<tr><td colspan="5" style="padding:.6rem; color:#93a2b8;">No probes yet.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = '';
+      for (const p of probes) {
+        const statusColor = p.status === 'OK' ? '#4ade80'
+                          : (p.status === 'FAILED' || p.status === 'ERROR') ? '#f87171'
+                          : '#fbbf24';
+        const detail = p.error || (p.serial ? `S/N ${p.serial}` : '—');
+        const row = document.createElement('tr');
+        row.style.borderTop = '1px solid #293342';
+        row.innerHTML = `
+          <td style="padding:.35rem .5rem; font-weight:600;">${p.device}</td>
+          <td style="padding:.35rem .5rem; font-family:ui-monospace,monospace; color:#93a2b8;">${p.port || '—'}</td>
+          <td style="padding:.35rem .5rem; color:${statusColor}; font-weight:600;">${p.status}</td>
+          <td style="padding:.35rem .5rem; color:#aebbd0;">${p.latency_ms != null ? p.latency_ms + ' ms' : '—'}</td>
+          <td style="padding:.35rem .5rem; color:#aebbd0;">${detail}</td>`;
+        tbody.appendChild(row);
+      }
+    }
     async function refresh() {
       const badge = $('connection');
       try {
@@ -101,7 +145,10 @@
         setText('distance', data.lidar_distance_mm > 0 ? `${Math.round(data.lidar_distance_mm)} mm` : '—');
         setText('command', data.final_command);
         setText('decision-reason', data.decision_reason || '—');
-        
+
+        renderProbes(data.sensor_probes);
+        setText('last-error', data.last_error || '— none —');
+
         for (const entry of data.logs || []) {
           const row = document.createElement('li');
           const stamp = new Date(entry.timestamp * 1000).toLocaleTimeString();

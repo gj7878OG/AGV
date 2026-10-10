@@ -39,6 +39,8 @@ def read_status():
             'final_command': 'S',
             'updated_at': None,
             'logs': [],
+            'sensor_probes': [],
+            'last_error': None,
         }
 
 
