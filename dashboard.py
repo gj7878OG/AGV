@@ -56,8 +56,14 @@ def status():
         after_id = int(request.args.get('after', '0'))
     except ValueError:
         after_id = 0
-    payload['logs'] = [entry for entry in payload.get('logs', [])
-                       if entry.get('id', 0) > after_id]
+    filtered = []
+    for entry in payload.get('logs', []):
+        if entry.get('id', 0) <= after_id:
+            continue
+        # Backfill category for any older entry that pre-dates the change.
+        entry.setdefault('category', 'SYSTEM')
+        filtered.append(entry)
+    payload['logs'] = filtered
     return jsonify(payload)
 
 

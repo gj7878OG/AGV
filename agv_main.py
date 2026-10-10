@@ -129,20 +129,59 @@ def _atomic_write(path, data):
             os.unlink(temp_path)
 
 
-def publish_telemetry(state, frame=None, log_message=None):
-    """Queue read-only state and frame; disk I/O stays off the control loop."""
+# Log categories — surfaced as separate dashboard panels.
+LOG_CAT_SYSTEM  = 'SYSTEM'   # startup, probe, config, exceptions
+LOG_CAT_CAMERA  = 'CAMERA'   # vision, line detection, frame errors
+LOG_CAT_LIDAR   = 'LIDAR'    # obstacle transitions, distance buckets, errors
+LOG_CAT_STM32   = 'STM32'    # ACK, encoder, watchdog, command send, errors
+
+LOG_CATEGORIES = (LOG_CAT_SYSTEM, LOG_CAT_CAMERA, LOG_CAT_LIDAR, LOG_CAT_STM32)
+
+
+def _normalize_log_message(message, category):
+    """Return ([{id, timestamp, category, message}, ...], default_category).
+
+    `message` may be a string, a list of strings, or a list of
+    (category, message) tuples. Strings get the default category.
+    """
+    if message is None:
+        return [], category
+    if isinstance(message, (list, tuple)):
+        items = message
+    else:
+        items = [message]
+    out = []
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, tuple) and len(item) == 2 and item[0] in LOG_CATEGORIES:
+            cat, text = item
+        else:
+            cat, text = category, str(item)
+        out.append({'category': cat, 'message': text})
+    return out, category
+
+
+def publish_telemetry(state, frame=None, log_message=None, log_category=LOG_CAT_SYSTEM):
+    """Queue read-only state and frame; disk I/O stays off the control loop.
+
+    `log_message` may be:
+      - a string (gets `log_category`)
+      - a list of strings (each gets `log_category`)
+      - a list of (category, text) tuples for mixed-category batches
+    """
     global telemetry_log_id, telemetry_pending
 
     with telemetry_lock:
-        messages = log_message if isinstance(log_message, (list, tuple)) else [log_message]
-        for message in messages:
-            if message:
-                telemetry_log_id += 1
-                telemetry_logs.append({
-                    'id': telemetry_log_id,
-                    'timestamp': time.time(),
-                    'message': message,
-                })
+        entries, _ = _normalize_log_message(log_message, log_category)
+        for entry in entries:
+            telemetry_log_id += 1
+            telemetry_logs.append({
+                'id': telemetry_log_id,
+                'timestamp': time.time(),
+                'category': entry['category'],
+                'message': entry['message'],
+            })
 
         payload = dict(state)
         payload.update({
@@ -211,6 +250,9 @@ def restore_telemetry_logs():
         with open(os.path.join(TELEMETRY_DIR, 'status.json'), 'r', encoding='utf-8') as status_file:
             previous = json.load(status_file)
         for entry in previous.get('logs', [])[-LOG_LIMIT:]:
+            # Backfill `category` for entries written before categorization.
+            if 'category' not in entry:
+                entry['category'] = LOG_CAT_SYSTEM
             telemetry_logs.append(entry)
             telemetry_log_id = max(telemetry_log_id, int(entry.get('id', 0)))
     except (OSError, ValueError, TypeError):
@@ -524,9 +566,9 @@ def run_agv():
         'sensor_probes': sensor_probes,
         'last_error': None,
     }, log_message=[
-        'AGV control process starting',
-        *(f"Probe {p['device']}: {p['status']} on {p['port']}"
-          for p in sensor_probes),
+        ('SYSTEM', 'AGV control process starting'),
+        *[(LOG_CAT_SYSTEM, f"Probe {p['device']}: {p['status']} on {p['port']}")
+          for p in sensor_probes],
     ])
 
     # 1. Open the camera first. Its preview and telemetry remain available
@@ -547,7 +589,7 @@ def run_agv():
             'lidar_connected': False, 'lidar_error': None,
             'lidar_distance_mm': 0, 'final_command': 'S',
             'sensor_probes': sensor_probes, 'last_error': last_error,
-        }, log_message='Camera unavailable — degraded mode')
+        }, log_message='Camera unavailable — degraded mode', log_category=LOG_CAT_CAMERA)
         cap = None
     else:
         log.info("[Camera]  IMX219 opened at 1280x720 @30fps")
@@ -576,7 +618,7 @@ def run_agv():
     }, log_message=(
         'STM32 connected; initial stop command sent' if stm32_connected
         else 'STM32 command write failed during startup'
-    ))
+    ), log_category=LOG_CAT_STM32)
 
     # 2. Start LiDAR in the background; do not block camera capture on it.
     lidar_t = threading.Thread(target=lidar_thread_func, daemon=True)
@@ -735,6 +777,10 @@ def run_agv():
                     if stm32_connected:
                         log.warning("STM32 ACK timeout (%.0f ms) — forcing STOP", ack_age_ms)
                         stm32_connected = False
+                        events.append((
+                            LOG_CAT_STM32,
+                            f"STM32 ACK timeout ({ack_age_ms:.0f} ms) — forced STOP"
+                        ))
 
                 # Send command to STM32 (only on change).
                 # When transitioning to forward, also push a speed byte first
@@ -746,63 +792,86 @@ def run_agv():
                         stm32_connected = send_to_stm32(stm, target_speed.encode())
                         last_speed_sent = target_speed
                     stm32_connected = send_to_stm32(stm, final_cmd.encode())
-                    log_message = (
-                        f"STM32: {final_cmd} | Camera: {direction} | "
-                        f"LiDAR: {obstacle_status} ({obstacle_dist:.0f} mm)"
-                    )
-                    log.info("  → %s", log_message)
+                    log_message = [
+                        (LOG_CAT_STM32,
+                         f"STM32 → {final_cmd}"
+                         + (f" (speed {target_speed})" if final_cmd == 'F' else '')),
+                    ]
+                    log.info("  → %s",
+                             f"STM32: {final_cmd} | Camera: {direction} | "
+                             f"LiDAR: {obstacle_status} ({obstacle_dist:.0f} mm)")
                     last_cmd = final_cmd
                 else:
                     log_message = None
 
                 # Record meaningful transitions, not every camera frame or raw
                 # LiDAR distance fluctuation. Distance changes are grouped in 250mm bands.
+                # `events` is a list of (category, message) tuples so each line
+                # routes to the right dashboard panel.
                 events = []
                 camera_state = (direction, camera_cmd)
                 lidar_bucket = int(obstacle_dist // 250) if obstacle_dist else 0
                 current_lidar_state = (obstacle_status, lidar_bucket)
                 if last_camera_state is not None and camera_state != last_camera_state:
-                    events.append(
+                    events.append((
+                        LOG_CAT_CAMERA,
                         f"Camera: {last_camera_state[0]} ({last_camera_state[1]}) → "
                         f"{direction} ({camera_cmd})"
-                    )
+                    ))
                 elif last_camera_state is None:
-                    events.append(f"Camera state: {direction} ({camera_cmd})")
+                    events.append((LOG_CAT_CAMERA, f"Camera state: {direction} ({camera_cmd})"))
                 if last_camera_connection is None:
-                    events.append('Camera connected' if camera_connected else 'Camera disconnected')
+                    events.append((
+                        LOG_CAT_CAMERA,
+                        'Camera connected' if camera_connected else 'Camera disconnected'
+                    ))
                 elif camera_connected != last_camera_connection:
-                    events.append('Camera connected' if camera_connected else 'Camera disconnected')
+                    events.append((
+                        LOG_CAT_CAMERA,
+                        'Camera connected' if camera_connected else 'Camera disconnected'
+                    ))
                 if last_stm32_connection is None:
-                    events.append('STM32 connected' if stm32_connected else 'STM32 disconnected')
+                    events.append((
+                        LOG_CAT_STM32,
+                        'STM32 connected' if stm32_connected else 'STM32 disconnected'
+                    ))
                 elif stm32_connected != last_stm32_connection:
-                    events.append('STM32 connected' if stm32_connected else 'STM32 disconnected')
+                    events.append((
+                        LOG_CAT_STM32,
+                        'STM32 connected' if stm32_connected else 'STM32 disconnected'
+                    ))
                 if last_lidar_connection is not None and lidar_connected != last_lidar_connection:
-                    events.append(
+                    events.append((
+                        LOG_CAT_LIDAR,
                         'LiDAR connected' if lidar_connected else
                         f"LiDAR disconnected{': ' + lidar_error if lidar_error else ''}"
-                    )
+                    ))
                 elif last_lidar_connection is None:
-                    events.append(
+                    events.append((
+                        LOG_CAT_LIDAR,
                         'LiDAR connected' if lidar_connected else
                         f"LiDAR unavailable{': ' + lidar_error if lidar_error else ' (connecting or not detected)'}"
-                    )
+                    ))
                 if last_lidar_state is not None and current_lidar_state != last_lidar_state:
                     old_distance = (
                         f"{last_lidar_state[1] * 250}–{(last_lidar_state[1] + 1) * 250} mm"
                         if last_lidar_state[1] else 'no obstacle'
                     )
                     new_distance = f"{obstacle_dist:.0f} mm" if obstacle_dist else 'no obstacle'
-                    events.append(
+                    events.append((
+                        LOG_CAT_LIDAR,
                         f"LiDAR: {last_lidar_state[0]} {old_distance} → "
                         f"{obstacle_status} {new_distance}"
-                    )
+                    ))
                 elif last_lidar_state is None:
                     distance_text = f" at {obstacle_dist:.0f} mm" if obstacle_dist else ''
-                    events.append(f"LiDAR state: {obstacle_status}{distance_text}")
+                    events.append((LOG_CAT_LIDAR, f"LiDAR state: {obstacle_status}{distance_text}"))
                 if last_final_cmd is not None and final_cmd != last_final_cmd:
-                    events.append(f"Final command: {last_final_cmd} → {final_cmd}")
+                    events.append((
+                        LOG_CAT_STM32, f"Final command: {last_final_cmd} → {final_cmd}"
+                    ))
                 elif last_final_cmd is None:
-                    events.append(f"Final command: {final_cmd}")
+                    events.append((LOG_CAT_STM32, f"Final command: {final_cmd}"))
                 if events:
                     log_message = events
                 last_camera_state = camera_state
@@ -882,7 +951,9 @@ def run_agv():
                         'decision_reason': f'Main loop error: {last_error}',
                         'sensor_probes': sensor_probes,
                         'last_error': tb,
-                    })
+                    }, log_message=(
+                        f"Main loop exception: {last_error}"
+                    ), log_category=LOG_CAT_SYSTEM)
                 except Exception as publish_exc:
                     log.error('[MainLoop]  Telemetry publish also failed: %s', publish_exc)
                 time.sleep(0.5)
@@ -946,10 +1017,12 @@ def run_agv():
             'sensor_probes': sensor_probes,
             'last_error': last_error,
         }, log_message=[
-            'Camera disconnected (capture closed)',
-            'LiDAR connected' if lidar_connected else 'LiDAR disconnected',
-            'STM32 serial link disconnected (port closed)' if stm else 'STM32 unavailable; camera stopped',
-            f'Camera stopped ({stop_reason})',
+            (LOG_CAT_CAMERA, 'Camera disconnected (capture closed)'),
+            (LOG_CAT_LIDAR,  'LiDAR connected' if lidar_connected else 'LiDAR disconnected'),
+            (LOG_CAT_STM32,
+             'STM32 serial link disconnected (port closed)' if stm
+             else 'STM32 unavailable; camera stopped'),
+            (LOG_CAT_SYSTEM, f'Camera stopped ({stop_reason})'),
         ])
         stop_telemetry_writer()
 
