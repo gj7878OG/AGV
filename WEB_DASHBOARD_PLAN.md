@@ -13,10 +13,19 @@ and recent decision logs.
 
 ## Current project basis
 
-`agv_main.py` currently runs the camera line detector, LiDAR safety logic, and
-STM32 command output in one control process. It already has the data needed by
-the dashboard. The camera loop calls `cv2.imshow()` and `cv2.waitKey()`;
-these are optional so the AGV can run without a local desktop display.
+`agv_main.py` is now a thin orchestrator. The work is split into focused
+modules:
+
+- `camera.py` — camera capture (argus / v4l2 / libcamera / fake)
+- `lidar.py` — RPLIDAR A1 reader (background thread)
+- `stm32.py` — STM32 serial (commands, ACK, encoder, version)
+- `decision.py` — pure function: camera + lidar → motor command
+- `telemetry.py` — atomic on-disk publisher (status.json + frame.jpg)
+- `web.py` — read-only dashboard (Flask + WebSocket)
+
+The orchestrator wires the modules together and decides when to publish a
+state transition. `cv2.imshow()` and `cv2.waitKey()` are conditional on
+`AGV_SHOW_WINDOW`; headless operation is the default without `DISPLAY`.
 
 The software paths are present, but hardware operation must be verified on the
 Jetson before describing the integrated camera, LiDAR, and motor-control system
@@ -31,11 +40,15 @@ directory. The dashboard process reads those files and serves the page and API
 with Flask.
 
 ```text
-Camera + LiDAR
-      ↓
-agv_main.py ── atomically updated status/frame files ──> Flask dashboard
-      ↓                                                  ↓
-STM32 commands                                      Browser on Wi-Fi
+camera.py  lidar.py  stm32.py
+      \      |       /
+       agv_main.py  (orchestrator)
+              |
+       decision.py  (pure: camera+lidar → cmd)
+              |
+       telemetry.py  ── atomically updated status/frame files ──>  web.py
+                                                                          |
+                                                                       Browser
 ```
 
 Use a configurable runtime directory, `/tmp/agv-dashboard/` by default. Write
@@ -74,14 +87,17 @@ these in a scrollable, newest-first log.
 
 ## Implementation and validation status
 
-1. **Implemented:** `agv_main.py` publishes the current
-   annotated frame, camera decision, LiDAR readings, final command, timestamp,
-   and bounded event history using atomic file replacement on a background
-   telemetry writer.
+1. **Implemented:** `telemetry.py` publishes the current annotated frame,
+   camera decision, LiDAR readings, final command, timestamp, encoder
+   counts/deltas, firmware version, and bounded event history using atomic
+   file replacement on a background writer. The control loop never blocks on
+   disk I/O.
 2. **Implemented:** `cv2.imshow()` and `cv2.waitKey()` are conditional on
    `AGV_SHOW_WINDOW`; headless operation is the default without `DISPLAY`.
-3. **Implemented:** `dashboard.py` and `templates/dashboard.html` read
-   telemetry files and do not open serial ports or control the vehicle.
+3. **Implemented:** `web.py` (Flask + WebSocket) is the current dashboard
+   reader. The earlier `dashboard.py` is kept for reference but is not the
+   recommended entry point. Neither file opens serial ports or controls the
+   vehicle.
 4. **Implemented:** Dependencies and startup instructions are documented in
    this file and `AGV_README.md`.
 5. **Pending hardware validation:** Confirm page, status freshness, and video
@@ -115,7 +131,7 @@ python3 agv_main.py
 
 ```bash
 . .venv-dashboard/bin/activate
-python dashboard.py
+python web.py
 ```
 
 Open `http://<jetson-lan-ip>:5000` from another device on the same network.

@@ -69,3 +69,46 @@ the same misleading startup message before reporting a frame-read error.
 The local preview window also requires `AGV_SHOW_WINDOW=1` and an available
 graphical display. With `AGV_SHOW_WINDOW=0`, capture can run headlessly, but no
 local OpenCV window is shown.
+
+------------------------------------------------------------------------
+
+# Resolution — 2026-10-15
+
+**Status:** Resolved. The camera now captures frames through the project's own
+`cv2.VideoCapture(config.get_camera_pipeline('argus'), cv2.CAP_GSTREAMER)`
+on Jetson Orin Nano running Jetson Linux R39.2 (Ubuntu 24.04.5).
+
+The 2026-10-09 failure had **three layered causes**, none of which were a
+camera defect:
+
+1. **CSI ribbon was unseated on the Jetson side.** After fully powering off
+   and reseating the cable at CAM0, `i2cdetect -y -r 9` showed the IMX219
+   at `0x10` (`UU` = kernel driver bound), `/dev/video0` appeared, and
+   Argus began listing the five native sensor modes
+   (3280×2464@21, 3280×1848@28, 1920×1080@30, 1640×1232@30, 1280×720@60).
+
+2. **OpenCV shipped without GStreamer.** A pip-installed
+   `opencv-python-headless` was shadowing the apt `python3-opencv 4.6.0`
+   because `~/.local/lib/python3.12/site-packages` precedes
+   `/usr/lib/python3/dist-packages` on `sys.path`. The pip aarch64 wheel
+   has `GStreamer: NO`; the apt one has `GStreamer: YES (1.24.1)`. Fix:
+   uninstall the pip package and use `/usr/bin/python3`.
+
+3. **Pipeline framerate was wrong.** The project's `config.py` and
+   `camera_test.py` were hard-coded to `1280×720 @ 30 fps`, but the IMX219
+   driver exposes 1280×720 only at **60 fps**. With 30 fps in the caps
+   filter, `nvarguscamerasrc` cannot negotiate and
+   `cv2.VideoCapture.isOpened()` returns `False`. Fix:
+   `CAMERA_FPS = 30 → 60` in `config.py` and the pipeline string in
+   `camera_test.py`.
+
+After the three fixes, a 30-frame live burst at 1280×720@60 was captured
+with `gst-launch-1.0` (frames at `/tmp/cam-out/frame_000.jpg` …
+`frame_029.jpg`), and a single frame was captured through the project's
+own pipeline at `/tmp/cam-out/project_pipeline.jpg` (mean pixel value
+≈ 70, confirming a real image, not a black frame).
+
+**Remaining open issues from this report:**
+
+- `/dev/ttyTHS1` (STM32) permission — out of scope for the camera fix.
+- `/dev/ttyUSB0` (LiDAR) not present — out of scope for the camera fix.

@@ -1,11 +1,14 @@
 # Autonomous Guided Vehicle (AGV) --- Jetson Nano Computer Vision Platform
 
-> **Implementation status:** `agv_main.py` is the current unified prototype.
-> It contains camera line detection, LiDAR safety logic, and STM32 serial
-> commands. Hardware validation is a separate step; the presence of code does
-> not mean the integrated system has been tested on the vehicle. The browser
-> dashboard is planned in [WEB_DASHBOARD_PLAN.md](WEB_DASHBOARD_PLAN.md) and is
-> not implemented yet.
+> **Implementation status (2026-10-15):** The control loop is now split into
+> focused modules — `camera.py`, `lidar.py`, `stm32.py`, `decision.py`,
+> `telemetry.py`, `web.py` — with `agv_main.py` as a thin orchestrator.
+> Camera capture works through `cv2.VideoCapture` on Jetson Orin Nano
+> (IMX219 on CAM0, `1280×720 @ 60 fps`). The browser dashboard is
+> implemented in `web.py` (Flask + WebSocket). The STM32 firmware moved
+> to `firmware/main_v3.c`. Hardware validation on the full vehicle has
+> not been completed; LiDAR (`/dev/ttyUSB0`) and STM32 (`/dev/ttyTHS1`)
+> still need to be brought up.
 
 ## 1. Project Overview
 
@@ -505,29 +508,46 @@ The current project directory includes:
 
 ``` text
 agv/
-├── agv_main.py
-├── main.c
-├── main.h
-├── camera_test.py
-├── manual_motor_test.py
-├── dashboard.py
-├── requirements-dashboard.txt
+├── agv_main.py             # thin orchestrator
+├── config.py               # tunables + camera-backend selection
+├── camera.py               # camera abstraction (argus/v4l2/libcamera/fake)
+├── yellow_line.py          # yellow-line detection (HSV + contour)
+├── lidar.py                # RPLIDAR A1 wrapper (background thread)
+├── stm32.py                # STM32 serial (commands, ACK, encoder, version)
+├── decision.py             # pure: camera + lidar → motor command
+├── telemetry.py            # atomic on-disk publisher (status.json + frame.jpg)
+├── web.py                  # Flask + WebSocket dashboard (current)
+├── dashboard.py            # legacy Flask-only dashboard (reference)
 ├── templates/dashboard.html
-├── yellow_line.py
-└── WEB_DASHBOARD_PLAN.md
+├── camera_test.py          # standalone camera bring-up tool
+├── manual_motor_test.py    # manual STM32 test harness
+├── requirements-dashboard.txt
+├── firmware/               # STM32 firmware (v3)
+│   ├── Makefile
+│   ├── main_v3.c
+│   ├── main.h
+│   ├── stm32f4xx_hal_conf.h
+│   └── stm32f4xx_hal_msp.c
+├── WEB_DASHBOARD_PLAN.md
+├── CAMERA_DIAGNOSTIC_REPORT.md
+└── AGV_README.md
 ```
 
-`agv_main.py` is the unified camera + LiDAR + STM32 prototype. The other
-scripts are standalone camera, line-following, and LiDAR experiments. The
-read-only dashboard is implemented in `dashboard.py` and `templates/`.
+`agv_main.py` is the thin orchestrator. The actual work lives in the
+focused modules. The read-only dashboard is `web.py`; `dashboard.py` is
+the older Flask-only reader kept for reference.
 
 ## `agv_main.py`
 
 Purpose:
 
--   Detect and follow the yellow line using the IMX219 camera and OpenCV.
--   Use LiDAR readings for stop and slow safety behavior.
--   Send the final command to the STM32 over serial.
+-   Wire the modules together in the main control loop.
+-   Decide when to publish a state transition.
+
+The orchestrator only does orchestration; the line-detection logic is
+in `yellow_line.py`, the sensor handling is in `camera.py`/`lidar.py`/
+`stm32.py`, the safety combination is in `decision.py`, and the
+telemetry is in `telemetry.py`.
 
 Current status:
 
@@ -536,17 +556,17 @@ confirmed separately.**
 
 ### Optional read-only web dashboard
 
-The dashboard runs as a separate process and reads status and annotated frames
-published by `agv_main.py`. It does not access the camera or send motor
-commands. The activity panel records startup/shutdown, sensor connection
-problems, camera direction changes, LiDAR state/distance-band changes, and
-final command changes. The state panel shows whether camera capture, LiDAR, and
-the STM32 serial link are connected. It keeps the latest 500 events, newest
-first.
+The dashboard runs as a separate process and reads status and annotated
+frames published by `telemetry.py` (via the shared telemetry directory).
+It does not access the camera or send motor commands. The activity panel
+records startup/shutdown, sensor connection problems, camera direction
+changes, LiDAR state/distance-band changes, and final command changes.
+The state panel shows whether camera capture, LiDAR, and the STM32
+serial link are connected. It keeps the latest 500 events, newest first.
 
-Create an isolated dashboard environment and install Flask. On older Jetson
-Python releases, upgrade the packaging tools first so pip can select the ARM
-wheels:
+Create an isolated dashboard environment and install Flask. On older
+Jetson Python releases, upgrade the packaging tools first so pip can
+select the ARM wheels:
 
 ```bash
 python3 -m venv .venv-dashboard
@@ -565,27 +585,44 @@ Start the dashboard in another terminal as the same user:
 
 ```bash
 . .venv-dashboard/bin/activate
-python dashboard.py
+python web.py
 ```
 
-Open `http://<jetson-lan-ip>:5000` from a device on the same Wi-Fi network. Both
-processes use `/tmp/agv-dashboard` by default; set `AGV_DASHBOARD_DIR` in both
-if using another directory. The dashboard is read-only and intended for a
-trusted local network.
+Open `http://<jetson-lan-ip>:5000` from a device on the same Wi-Fi
+network. Both processes use `/tmp/agv-dashboard` by default; set
+`AGV_DASHBOARD_DIR` in both if using another directory. The dashboard is
+read-only and intended for a trusted local network.
 
-## `camera_test.py`
+## `camera.py` and `camera_test.py`
 
 Purpose:
 
--   Verify camera capture.
--   Display camera frames.
--   Establish the basic camera pipeline before computer vision is added.
+-   `camera.py` is the production camera abstraction used by `agv_main.py`.
+    It supports four backends (argus, v4l2, libcamera, fake) selected
+    via `AGV_CAMERA_BACKEND`.
+-   `camera_test.py` is a standalone capture tool. It opens
+    `cv2.VideoCapture` on the project's argus pipeline and shows frames
+    in an OpenCV window (or runs headlessly with `AGV_SHOW_WINDOW=0`).
+
+Pipeline (argus backend):
+
+```text
+nvarguscamerasrc sensor-id=0
+  ! video/x-raw(memory:NVMM),width=1280,height=720,format=NV12,framerate=60/1
+  ! nvvidconv
+  ! video/x-raw,format=BGRx
+  ! videoconvert
+  ! video/x-raw,format=BGR
+  ! appsink
+```
 
 Current status:
 
-**Created. An earlier bring-up attempt recorded an Argus/IMX219 capture
-failure; recheck the camera on the current Jetson before relying on that
-diagnosis.**
+**Working on Jetson Orin Nano (JetPack R39.2).** The IMX219 exposes
+`1280×720` only at 60 fps; the pipeline is configured accordingly. A
+fresh `i2cdetect -y -r 9` should show `0x10: UU` on the cam-i2cmux
+channel 0 (CAM0). The full bring-up story is in
+[`CAMERA_DIAGNOSTIC_REPORT.md`](CAMERA_DIAGNOSTIC_REPORT.md).
 
 ------------------------------------------------------------------------
 
@@ -593,19 +630,24 @@ diagnosis.**
 
 Purpose:
 
--   Prototype yellow-line detection.
--   Process camera frames.
--   Detect the yellow navigation line.
--   Eventually calculate line position and steering direction.
+-   Detect the yellow navigation line in a BGR frame.
+-   Compute the line centroid and direction (LEFT / CENTER / RIGHT /
+    LOST).
 
 Current status:
 
-**Created as the line-detection stage, but should be tested after
-reliable camera capture is restored.**
+**Implemented.** Use on a live `cv2.VideoCapture` from `camera.py` or
+run a one-off frame test:
+
+```bash
+/usr/bin/python3 -c "import yellow_line as yl; ..."
+```
+
+Validation against the live IMX219 feed is part of Phase 3.
 
 ------------------------------------------------------------------------
 
-# 13. Camera Bring-Up Notes (Historical; Recheck)
+# 13. Camera Bring-Up Notes (Historical)
 
 The Linux device layer detects the camera:
 
@@ -626,9 +668,17 @@ Therefore:
 Camera device detected          YES
 IMX219 driver/device visible    YES
 /dev/video0                     YES
-Actual frame capture            NO
-Argus CaptureSession            FAILING
+Actual frame capture            YES     (was NO before 2026-10-15 fix)
+Argus CaptureSession            OK      (was FAILING before fix)
 ```
+
+**Resolution (2026-10-15):** the camera now produces frames through the
+project's own `cv2.VideoCapture(config.get_camera_pipeline('argus'),
+cv2.CAP_GSTREAMER)`. The full root-cause write-up and proof frames are
+in [`CAMERA_DIAGNOSTIC_REPORT.md`](CAMERA_DIAGNOSTIC_REPORT.md). Three
+issues had to be fixed in order: reseat the CSI ribbon, use the apt
+`python3-opencv` (not a pip wheel without GStreamer), and set
+`CAMERA_FPS = 60` (the IMX219 exposes 1280×720 only at 60 fps).
 
 ------------------------------------------------------------------------
 
@@ -769,8 +819,11 @@ Only after this succeeds should the Python/OpenCV layer be tested again.
 -   [x] `/dev/video0` detected
 -   [x] IMX219 driver visible
 -   [x] GStreamer/Argus pipeline tested
--   [ ] Stable camera frame capture
--   [ ] OpenCV camera preview
+-   [x] Stable camera frame capture (`config.get_camera_pipeline('argus')`,
+        `1280×720 @ 60 fps`, 30-frame live burst saved to
+        `/tmp/cam-out/frame_*.jpg`)
+-   [x] OpenCV camera preview (frame mean ≈ 70, non-zero, in-focus
+        through `cv2.VideoCapture(CAMERA_PIPELINE, cv2.CAP_GSTREAMER)`)
 
 ## Phase 3 --- Yellow Line Detection
 
@@ -833,51 +886,36 @@ Only after this succeeds should the Python/OpenCV layer be tested again.
 
 ------------------------------------------------------------------------
 
-# 18. Proposed Software Architecture
+# 18. Software Architecture (Implemented)
 
-A clean final software structure can be:
+A flat-module split is in place; the proposed folder structure above
+was kept in mind, but the modules live at the project root for now to
+keep imports simple.
 
 ``` text
 agv/
-│
-├── camera/
-│   ├── camera_test.py
-│   └── camera_pipeline.py
-│
-├── vision/
-│   ├── yellow_line.py
-│   ├── line_detector.py
-│   └── human_detector.py
-│
-├── sensors/
-│   └── lidar.py
-│
-├── navigation/
-│   ├── steering.py
-│   └── obstacle_manager.py
-│
-├── control/
-│   └── motor_controller.py
-│
-├── config/
-│   └── parameters.py
-│
-├── tests/
-│
-└── README.md
+├── agv_main.py             # orchestrator
+├── config.py               # tunables
+├── camera.py               # argus / v4l2 / libcamera / fake
+├── yellow_line.py          # HSV + contour centroid
+├── lidar.py                # RPLIDAR A1
+├── stm32.py                # UART: F/B/L/R/S + speed + ACK + encoder + V<n>
+├── decision.py             # pure: (camera, lidar) → motor command
+├── telemetry.py            # atomic status.json + frame.jpg
+├── web.py                  # Flask + WebSocket dashboard
+└── firmware/               # STM32 v3
 ```
 
-This structure separates:
+The split separates:
 
--   Camera acquisition
--   Computer vision
--   Sensors
--   Navigation
--   Motor control
--   Configuration
--   Testing
+-   **Capture** (`camera.py`) from **perception** (`yellow_line.py`)
+-   **Sensors** (`lidar.py`, `stm32.py`) from **decision** (`decision.py`)
+-   **Control loop** (`agv_main.py`) from **publishing** (`telemetry.py`)
+    and **UI** (`web.py`)
 
-This will make the project easier to debug and extend.
+This keeps each module under ~250 lines, makes them independently
+testable, and lets the dashboard be restarted without touching the
+control loop.
 
 ------------------------------------------------------------------------
 
@@ -980,10 +1018,16 @@ system.
 
 ## Test 1 --- Camera
 
+```bash
+i2cdetect -y -r 9                # expect 0x10: UU
+ls /dev/video*                   # expect /dev/video0
+/usr/bin/python3 camera_test.py  # headless: set AGV_SHOW_WINDOW=0
+```
+
 Expected result:
 
 ``` text
-Live camera preview
+Live camera preview (or saved JPEG frames when running headless)
 ```
 
 ## Test 2 --- Yellow segmentation
