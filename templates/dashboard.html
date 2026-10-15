@@ -41,6 +41,7 @@
     .log-empty { color: #6b7a90; padding: .5rem .75rem; font: .8rem/1.4 ui-monospace, monospace; }
     .pill { padding: .25rem .65rem; border-radius: 999px; background: #344054; font-size: .8rem; }
     .pill.ok { background: #14532d; } .pill.warn { background: #854d0e; } .pill.bad { background: #7f1d1d; }
+    .backend { font: .7rem/1 ui-monospace, monospace; color: #6b7a90; margin-left: .5rem; }
     @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } .video { min-height: 180px; } .log-grid { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -52,7 +53,7 @@
   <main>
     <div class="grid">
       <section class="card">
-        <h2>Annotated camera</h2>
+        <h2>Annotated camera <span id="backend-label" class="backend"></span></h2>
         <img class="video" src="{{ url_for('video_feed') }}" alt="Live annotated camera stream">
       </section>
       <section class="card">
@@ -68,7 +69,7 @@
           <div class="stat" style="background: #1e3a8a;"><span class="label" style="color: #bfdbfe;">Final Motor Command</span><span id="command" class="value" style="color: white; font-weight: bold;">—</span></div>
           <div class="stat" style="background: #1e3a8a;"><span class="label" style="color: #bfdbfe;">Active Decision (Why it's moving)</span><span id="decision-reason" class="value" style="color: white; font-size: 0.95rem;">—</span></div>
         </div>
-        <p class="hint">STM32 status reflects serial port and command-write health; the current firmware does not send an acknowledgment.</p>
+        <p class="hint">STM32 status reflects the ACK watchdog; the Jetson marks the link dead after <code>{{ config.STM32_ACK_TIMEOUT_MS if config else 500 }}</code> ms of silence.</p>
       </section>
       <section class="card">
         <h2>Sensor probes · startup wiring check</h2>
@@ -168,7 +169,6 @@
       if (!list.children.length) {
         list.innerHTML = EMPTY;
       } else {
-        // Remove placeholder if it exists alongside real entries.
         const placeholder = list.querySelector('.log-empty');
         if (placeholder) placeholder.remove();
       }
@@ -177,7 +177,6 @@
       const cat = entry.category || 'SYSTEM';
       const panel = LOG_PANELS[cat] || LOG_PANELS.SYSTEM;
       const list = $(panel.list);
-      // First real entry: drop the empty-state placeholder.
       if (list.children.length === 1 && list.firstElementChild.classList.contains('log-empty')) {
         list.innerHTML = '';
       }
@@ -190,48 +189,60 @@
       li.appendChild(document.createTextNode(entry.message || ''));
       list.prepend(li);
       while (list.children.length > PANEL_MAX) list.lastElementChild.remove();
-
       panelCounts[cat] = (panelCounts[cat] || 0) + 1;
       $(panel.count).textContent = panelCounts[cat];
     }
-    async function refresh() {
+    function apply(data) {
+      const age = data.updated_at ? (Date.now() / 1000 - data.updated_at) : Infinity;
+      const fresh = age < 3;
       const badge = $('connection');
-      try {
-        const response = await fetch(`/status?after=${lastLogId}`, { cache: 'no-store' });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
-        const age = data.updated_at ? (Date.now() / 1000 - data.updated_at) : Infinity;
-        const fresh = age < 3;
-        badge.textContent = fresh ? 'LIVE' : 'STALE / WAITING';
-        badge.className = `pill ${fresh ? 'ok' : 'warn'}`;
-        setText('direction', data.camera_direction);
-        setText('camera-command', data.camera_command);
-        setConnection('camera-link', data.camera_connected, fresh, typeof data.camera_connected === 'boolean');
-        setText('lidar', data.lidar_status);
-        setConnection('lidar-link', data.lidar_connected, fresh, typeof data.lidar_connected === 'boolean');
-        setConnection('stm32-link', data.stm32_connected, fresh, typeof data.stm32_connected === 'boolean');
-        setText('distance', data.lidar_distance_mm > 0 ? `${Math.round(data.lidar_distance_mm)} mm` : '—');
-        setText('command', data.final_command);
-        setText('decision-reason', data.decision_reason || '—');
-
-        renderProbes(data.sensor_probes);
-        setText('last-error', data.last_error || '— none —');
-
-        for (const entry of data.logs || []) {
-          appendLogEntry(entry);
-          lastLogId = Math.max(lastLogId, entry.id || 0);
-        }
-      } catch (error) {
-        badge.textContent = 'OFFLINE';
-        badge.className = 'pill bad';
+      badge.textContent = fresh ? 'LIVE' : 'STALE / WAITING';
+      badge.className = `pill ${fresh ? 'ok' : 'warn'}`;
+      setText('direction', data.camera_direction);
+      setText('camera-command', data.camera_command);
+      setConnection('camera-link', data.camera_connected, fresh, typeof data.camera_connected === 'boolean');
+      setText('lidar', data.lidar_status);
+      setConnection('lidar-link', data.lidar_connected, fresh, typeof data.lidar_connected === 'boolean');
+      setConnection('stm32-link', data.stm32_connected, fresh, typeof data.stm32_connected === 'boolean');
+      setText('distance', data.lidar_distance_mm > 0 ? `${Math.round(data.lidar_distance_mm)} mm` : '—');
+      setText('command', data.final_command);
+      setText('decision-reason', data.decision_reason || '—');
+      setText('backend-label', data.camera_backend ? `[${data.camera_backend}]` : '');
+      renderProbes(data.sensor_probes);
+      setText('last-error', data.last_error || '— none —');
+      for (const entry of data.logs || []) {
+        appendLogEntry(entry);
+        lastLogId = Math.max(lastLogId, entry.id || 0);
       }
     }
-    // Initialize empty-state placeholders.
+    function startWebSocket() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const url = `${proto}://${location.hostname}:{{ DASHBOARD_WS_PORT }}`;
+      let ws, retryDelay = 500;
+      function connect() {
+        ws = new WebSocket(url);
+        ws.onopen = () => { retryDelay = 500; };
+        ws.onmessage = (ev) => {
+          try { apply(JSON.parse(ev.data)); }
+          catch (err) { console.warn('ws parse', err); }
+        };
+        ws.onclose = () => {
+          $('connection').textContent = 'OFFLINE';
+          $('connection').className = 'pill bad';
+          setTimeout(connect, retryDelay);
+          retryDelay = Math.min(retryDelay * 2, 5000);
+        };
+        ws.onerror = () => ws.close();
+      }
+      connect();
+    }
     for (const cat of Object.keys(LOG_PANELS)) {
       ensureEmptyState(LOG_PANELS[cat].list);
     }
-    refresh();
-    setInterval(refresh, 500);
+    // First paint from /status, then live updates via WebSocket.
+    fetch('/status', { cache: 'no-store' })
+      .then(r => r.json()).then(apply).catch(() => {});
+    startWebSocket();
   </script>
 </body>
 </html>

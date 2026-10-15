@@ -3,7 +3,7 @@ import cv2
 pipeline = (
     "nvarguscamerasrc sensor-id=0 ! "
     "video/x-raw(memory:NVMM), width=1280, height=720, "
-    "format=NV12, framerate=30/1 ! "
+    "format=NV12, framerate=60/1 ! "
     "nvvidconv ! "
     "video/x-raw, format=BGRx ! "
     "videoconvert ! "

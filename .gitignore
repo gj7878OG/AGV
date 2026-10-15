@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local runtime artifacts
+*.log
+*.pid

@@ -1,178 +1,132 @@
 #!/usr/bin/env python3
-"""
-Yellow Line Follower — Connected to STM32
-==========================================
-IMX219 camera on Jetson Nano detects a yellow line and sends
-steering commands to STM32 via UART.
+"""Standalone yellow-line follower.
 
-Wiring:
-  IMX219 Camera → Jetson Nano CSI ribbon
-  Jetson TX     → STM32 PA10 (RX)
-  Jetson RX     → STM32 PA9  (TX)
-  Jetson GND    → STM32 GND
+Same behaviour as before, but uses the new modular split:
 
-Commands sent to STM32:
-  'L' = Turn Left   (yellow line is left of center)
-  'R' = Turn Right   (yellow line is right of center)
-  'F' = Go Forward   (yellow line is centered)
-  'S' = Stop         (no yellow line detected)
+  camera  → Camera (any backend)
+  stm32   → STM32 (ACK/encoder + commands)
+  decision→ pure line-following verdict
 """
+
+from __future__ import annotations
+
+import logging
+import time
 
 import cv2
 import numpy as np
-import serial
-import time
 
-# --- CONFIGURATION ---
-STM32_PORT = '/dev/ttyTHS1'     # Jetson Nano UART1 to STM32
-BAUD_RATE  = 115200
-
-# Steering thresholds (pixels from center)
-STEER_DEADZONE = 80             # Within +/- 80px = centered, go straight
-
-# GStreamer pipeline for IMX219 on Jetson Nano
-CAMERA_PIPELINE = (
-    "nvarguscamerasrc sensor-id=0 ! "
-    "video/x-raw(memory:NVMM), width=1280, height=720, "
-    "format=NV12, framerate=30/1 ! "
-    "nvvidconv ! "
-    "video/x-raw, format=BGRx ! "
-    "videoconvert ! "
-    "video/x-raw, format=BGR ! "
-    "appsink"
-)
+from camera import Camera, detect_yellow_centroid
+from config import (CAMERA_BACKEND, MIN_CONTOUR_AREA, MORPHOLOGY_KERNEL,
+                   SHOW_WINDOW, STEER_DEADZONE, YELLOW_HSV_LOWER,
+                   YELLOW_HSV_UPPER)
+from decision import Direction
+from stm32 import STM32
 
 
-def connect_stm32():
-    """Connect to STM32 via UART. Returns serial object or None."""
-    try:
-        stm = serial.Serial(STM32_PORT, BAUD_RATE, timeout=1)
-        time.sleep(1)
-        print(f"✅ STM32 connected on {STM32_PORT}")
-        return stm
-    except Exception as e:
-        print(f"⚠️  STM32 not connected: {e}")
-        print("   Running in VISION-ONLY mode (no motor control)")
-        return None
+def draw_overlay(frame: np.ndarray, direction: Direction,
+                 centroid: tuple[int, int] | None, cmd: str, error: int) -> None:
+    if centroid is not None:
+        cx, cy = centroid
+        cv2.drawContours(frame, [cv2.convexHull(
+            np.array([[cx - 30, cy - 30], [cx + 30, cy - 30],
+                       [cx + 30, cy + 30], [cx - 30, cy + 30]],
+                      dtype=np.int32))], -1, (0, 255, 0), 3)
+        cv2.circle(frame, (cx, cy), 10, (0, 0, 255), -1)
+        cv2.line(frame, (frame.shape[1] // 2, 0),
+                 (frame.shape[1] // 2, frame.shape[0]), (255, 0, 0), 2)
+
+    cv2.putText(frame, 'YELLOW LINE DETECTED' if centroid is not None
+                else 'NO YELLOW LINE → STOPPED',
+                (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                (0, 255, 0) if centroid is not None else (0, 0, 255), 2)
+    cv2.putText(frame, f'Direction: {direction.value} | Cmd: {cmd}',
+                (30, 95), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+    cv2.putText(frame, f'Error: {error}px',
+                (30, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
 
-def run_line_follower():
-    print("=" * 50)
-    print("  AGV Yellow Line Follower")
-    print("  IMX219 Camera → Jetson Nano → STM32")
-    print("=" * 50)
+def main() -> None:
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s [%(levelname)s] %(message)s')
+    log = logging.getLogger('agv.line')
 
-    # Connect to STM32
-    stm = connect_stm32()
+    print('=' * 50)
+    print('  AGV Yellow Line Follower')
+    print('  IMX219 Camera → Jetson Nano → STM32')
+    print('=' * 50)
 
-    # Open camera
-    print("Opening IMX219 camera...")
-    cap = cv2.VideoCapture(CAMERA_PIPELINE, cv2.CAP_GSTREAMER)
+    stm = STM32()
+    report = stm.connect()
+    if not report.opened:
+        print('⚠ STM32 unavailable — vision-only mode.')
 
-    if not cap.isOpened():
-        print("❌ Could not open IMX219 camera")
-        if stm:
-            stm.close()
+    cam = Camera()
+    report = cam.open()
+    if not report.opened:
+        print('❌ Could not open camera')
+        stm.close()
         return
-
-    print("✅ Camera opened at 1280x720 @30fps")
-    print("Tracking started... (Press Q in window to stop)\n")
+    print('✅ Camera opened')
 
     last_cmd = None
+    error = 0
+    direction = Direction.UNAVAILABLE
+    cmd = 'S'
+    centroid = None
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("❌ Could not read frame")
-            break
+    try:
+        while True:
+            info = cam.latest()
+            frame = info.image if info else None
+            if frame is None:
+                time.sleep(0.02)
+                continue
 
-        # Convert to HSV
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            detected = detect_yellow_centroid(
+                frame,
+                lower=YELLOW_HSV_LOWER, upper=YELLOW_HSV_UPPER,
+                min_area=MIN_CONTOUR_AREA, kernel=MORPHOLOGY_KERNEL,
+            )
+            if detected is None:
+                direction = Direction.LOST
+                cmd = 'S'
+                centroid = None
+            else:
+                cx, cy, _area = detected
+                centroid = (cx, cy)
+                center_x = frame.shape[1] // 2
+                error = cx - center_x
+                if error < -STEER_DEADZONE:
+                    direction = Direction.LEFT; cmd = 'L'
+                elif error > STEER_DEADZONE:
+                    direction = Direction.RIGHT; cmd = 'R'
+                else:
+                    direction = Direction.CENTER; cmd = 'F'
 
-        # Yellow HSV range
-        lower_yellow = np.array([20, 100, 100])
-        upper_yellow = np.array([35, 255, 255])
+            if cmd != last_cmd:
+                stm.send(cmd)
+                print(f'  → CMD: {cmd}')
+                last_cmd = cmd
 
-        # Create mask
-        mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
-
-        # Remove noise
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-        # Find contours
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        output = frame.copy()
-        center_x = frame.shape[1] // 2
-        cmd = 'S'  # Default: stop if no line
-
-        if contours:
-            # Largest yellow contour
-            contour = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(contour)
-
-            if area > 500:
-                M = cv2.moments(contour)
-
-                if M["m00"] != 0:
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-
-                    # Calculate steering error
-                    error = cx - center_x
-
-                    if error < -STEER_DEADZONE:
-                        direction = "LEFT"
-                        cmd = 'L'
-                    elif error > STEER_DEADZONE:
-                        direction = "RIGHT"
-                        cmd = 'R'
-                    else:
-                        direction = "CENTER"
-                        cmd = 'F'
-
-                    # Draw visuals
-                    cv2.drawContours(output, [contour], -1, (0, 255, 0), 3)
-                    cv2.circle(output, (cx, cy), 10, (0, 0, 255), -1)
-                    cv2.line(output, (center_x, 0), (center_x, frame.shape[0]), (255, 0, 0), 2)
-
-                    cv2.putText(output, "YELLOW LINE DETECTED",
-                                (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    cv2.putText(output, f"Direction: {direction} | Cmd: {cmd}",
-                                (30, 95), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-                    cv2.putText(output, f"Error: {error}px",
-                                (30, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        else:
-            cmd = 'S'
-            cv2.putText(output, "NO YELLOW LINE → STOPPED",
-                        (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-        # Send command to STM32 (only if changed)
-        if cmd != last_cmd:
-            if stm:
-                stm.write(cmd.encode())
-            print(f"  → CMD: {cmd}")
-            last_cmd = cmd
-
-        cv2.imshow("AGV Yellow Line", output)
-        cv2.imshow("Yellow Mask", mask)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-    # Cleanup
-    if stm:
-        stm.write(b'S')
-        stm.close()
-        print("STM32: Motors stopped, serial closed.")
-    cap.release()
-    cv2.destroyAllWindows()
-    print("Camera released.")
+            if SHOW_WINDOW:
+                output = frame.copy()
+                draw_overlay(output, direction, centroid, cmd, error)
+                cv2.imshow('AGV Yellow Line', output)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if stm.isOpen():
+            stm.send('S')
+            stm.close()
+            print('STM32: Motors stopped, serial closed.')
+        cam.release()
+        if SHOW_WINDOW:
+            cv2.destroyAllWindows()
+        print('Camera released.')
 
 
 if __name__ == '__main__':
-    run_line_follower()
+    main()
