@@ -43,31 +43,49 @@ FRAME_PATH = Path(TELEMETRY_DIR) / 'frame.jpg'
 flask_app = Flask('agv-dashboard')
 
 
+@flask_app.context_processor
+def inject_project_config():
+    """Make the project's `config.py` available to every template as
+    `project_config`. Without this, `{{ config.X }}` in the template would
+    resolve to Flask's own config object, not the AGV config module.
+    """
+    import config as _project_config
+    return {'project_config': _project_config}
+
+
 def _read_status() -> dict:
+    fallback = {
+        'running': False,
+        'camera_connected': None,
+        'camera_backend': 'argus',
+        'stm32_connected': None,
+        'stm32_ack_age_ms': 0.0,
+        'stm32_encoder_left': 0,
+        'stm32_encoder_right': 0,
+        'stm32_encoder_delta_left': 0,
+        'stm32_encoder_delta_right': 0,
+        'stm32_firmware_version': '',
+        'camera_direction': 'UNAVAILABLE',
+        'camera_command': 'S',
+        'lidar_status': 'UNKNOWN',
+        'lidar_connected': None,
+        'lidar_error': None,
+        'lidar_distance_mm': 0,
+        'final_command': 'S',
+        'decision_reason': '',
+        'updated_at': None,
+        'logs': [],
+        'sensor_probes': [],
+        'last_error': None,
+    }
     try:
         with STATUS_PATH.open('r', encoding='utf-8') as fh:
             payload = json.load(fh)
-        payload.setdefault('camera_connected', None)
-        payload.setdefault('lidar_connected', None)
-        payload.setdefault('stm32_connected', None)
+        for key, default in fallback.items():
+            payload.setdefault(key, default)
         return payload
     except (OSError, ValueError):
-        return {
-            'running': False,
-            'camera_connected': None,
-            'stm32_connected': None,
-            'camera_direction': 'UNAVAILABLE',
-            'camera_command': 'S',
-            'lidar_status': 'UNKNOWN',
-            'lidar_connected': None,
-            'lidar_error': None,
-            'lidar_distance_mm': 0,
-            'final_command': 'S',
-            'updated_at': None,
-            'logs': [],
-            'sensor_probes': [],
-            'last_error': None,
-        }
+        return fallback
 
 
 @flask_app.route('/', methods=['GET'])

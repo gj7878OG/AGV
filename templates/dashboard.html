@@ -42,12 +42,16 @@
     .pill { padding: .25rem .65rem; border-radius: 999px; background: #344054; font-size: .8rem; }
     .pill.ok { background: #14532d; } .pill.warn { background: #854d0e; } .pill.bad { background: #7f1d1d; }
     .backend { font: .7rem/1 ui-monospace, monospace; color: #6b7a90; margin-left: .5rem; }
+    .dot { display: inline-block; width: .55rem; height: .55rem; border-radius: 50%; margin-left: .5rem; vertical-align: middle; background: #6b7a90; }
+    .dot.running { background: #4ade80; box-shadow: 0 0 8px #4ade8088; }
+    .dot.stopped { background: #f87171; }
+    .sub-error { font: .72rem/1.35 ui-monospace, monospace; color: #fca5a5; margin-top: .35rem; word-break: break-word; }
     @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } .video { min-height: 180px; } .log-grid { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
   <header>
-    <h1>AGV MONITOR</h1>
+    <h1>AGV MONITOR <span id="running-dot" class="dot" title="AGV control loop"></span></h1>
     <span id="connection" class="pill">Connecting…</span>
   </header>
   <main>
@@ -60,8 +64,9 @@
         <h2>Vehicle state</h2>
         <div class="stats">
           <div class="stat"><span class="label">Camera direction</span><span id="direction" class="value">—</span></div>
+          <div class="stat"><span class="label">Camera command (compact)</span><span id="camera-command" class="value" style="font-family: ui-monospace, monospace;">—</span></div>
           <div class="stat"><span class="label">Camera connection</span><span id="camera-link" class="value device">—</span></div>
-          <div class="stat"><span class="label">LiDAR state</span><span id="lidar" class="value">—</span></div>
+          <div class="stat"><span class="label">LiDAR state</span><span id="lidar" class="value">—</span><div id="lidar-error" class="sub-error"></div></div>
           <div class="stat"><span class="label">LiDAR connection</span><span id="lidar-link" class="value device">—</span></div>
           <div class="stat"><span class="label">Obstacle distance</span><span id="distance" class="value">—</span></div>
           <div class="stat"><span class="label">STM32 serial link</span><span id="stm32-link" class="value device">—</span></div>
@@ -69,7 +74,19 @@
           <div class="stat" style="background: #1e3a8a;"><span class="label" style="color: #bfdbfe;">Final Motor Command</span><span id="command" class="value" style="color: white; font-weight: bold;">—</span></div>
           <div class="stat" style="background: #1e3a8a;"><span class="label" style="color: #bfdbfe;">Active Decision (Why it's moving)</span><span id="decision-reason" class="value" style="color: white; font-size: 0.95rem;">—</span></div>
         </div>
-        <p class="hint">STM32 status reflects the ACK watchdog; the Jetson marks the link dead after <code>{{ config.STM32_ACK_TIMEOUT_MS if config else 500 }}</code> ms of silence.</p>
+        <p class="hint">STM32 status reflects the ACK watchdog; the Jetson marks the link dead after <code>{{ project_config.STM32_ACK_TIMEOUT_MS }}</code> ms of silence.</p>
+      </section>
+      <section class="card">
+        <h2>STM32 · motor link</h2>
+        <div class="stats">
+          <div class="stat"><span class="label">Firmware version</span><span id="fw-version" class="value" style="font-family: ui-monospace, monospace;">—</span></div>
+          <div class="stat"><span class="label">ACK age</span><span id="ack-age" class="value" style="font-family: ui-monospace, monospace;">—</span></div>
+          <div class="stat"><span class="label">Encoder L (raw)</span><span id="enc-left" class="value" style="font-family: ui-monospace, monospace;">—</span></div>
+          <div class="stat"><span class="label">Encoder R (raw)</span><span id="enc-right" class="value" style="font-family: ui-monospace, monospace;">—</span></div>
+          <div class="stat"><span class="label">Encoder Δ L (since boot)</span><span id="enc-delta-left" class="value" style="font-family: ui-monospace, monospace;">—</span></div>
+          <div class="stat"><span class="label">Encoder Δ R (since boot)</span><span id="enc-delta-right" class="value" style="font-family: ui-monospace, monospace;">—</span></div>
+        </div>
+        <p class="hint">Deltas reset to 0 on the V&lt;n&gt; boot line. Raw encoders are 16-bit and wrap every 65 536 ticks; deltas are wrap-safe signed int16.</p>
       </section>
       <section class="card">
         <h2>Sensor probes · startup wiring check</h2>
@@ -198,16 +215,29 @@
       const badge = $('connection');
       badge.textContent = fresh ? 'LIVE' : 'STALE / WAITING';
       badge.className = `pill ${fresh ? 'ok' : 'warn'}`;
+      const dot = $('running-dot');
+      dot.className = `dot ${data.running ? 'running' : 'stopped'}`;
+      dot.title = data.running ? 'AGV control loop running' : 'AGV control loop stopped';
       setText('direction', data.camera_direction);
       setText('camera-command', data.camera_command);
       setConnection('camera-link', data.camera_connected, fresh, typeof data.camera_connected === 'boolean');
       setText('lidar', data.lidar_status);
+      const lidarErr = $('lidar-error');
+      lidarErr.textContent = data.lidar_error || '';
+      lidarErr.style.display = data.lidar_error ? 'block' : 'none';
       setConnection('lidar-link', data.lidar_connected, fresh, typeof data.lidar_connected === 'boolean');
       setConnection('stm32-link', data.stm32_connected, fresh, typeof data.stm32_connected === 'boolean');
       setText('distance', data.lidar_distance_mm > 0 ? `${Math.round(data.lidar_distance_mm)} mm` : '—');
       setText('command', data.final_command);
       setText('decision-reason', data.decision_reason || '—');
       setText('backend-label', data.camera_backend ? `[${data.camera_backend}]` : '');
+      setText('fw-version', data.stm32_firmware_version || '—');
+      setText('ack-age', data.stm32_ack_age_ms != null ? `${Math.round(data.stm32_ack_age_ms)} ms` : '—');
+      setText('enc-left', data.stm32_encoder_left ?? '—');
+      setText('enc-right', data.stm32_encoder_right ?? '—');
+      const fmtDelta = (v) => v == null ? '—' : (v >= 0 ? `+${v}` : `${v}`);
+      setText('enc-delta-left', fmtDelta(data.stm32_encoder_delta_left));
+      setText('enc-delta-right', fmtDelta(data.stm32_encoder_delta_right));
       renderProbes(data.sensor_probes);
       setText('last-error', data.last_error || '— none —');
       for (const entry of data.logs || []) {
