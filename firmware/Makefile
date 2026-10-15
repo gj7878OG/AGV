@@ -39,15 +39,20 @@ CFLAGS := -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 \
           -O2 -g3 -Wall -ffunction-sections -fdata-sections \
           $(DEFS) $(INCLUDES)
 
-LDSCRIPT := $(CMSIS_DIR)/Device/ST/STM32F4xx/Source/Templates/gcc/STM32F411RETx_FLASH.ld
-# Other common scripts in the same folder: STM32F407VGTx_FLASH.ld etc.
+# NOTE: ST removed the linker scripts from the upstream Drivers/CMSIS tree.
+# The example project at Projects/STM32F411RE-Nucleo/Templates/STM32CubeIDE/
+# is the canonical place to find them now.
+LDSCRIPT := $(CUBE_DIR)/Projects/STM32F411RE-Nucleo/Templates/STM32CubeIDE/STM32F411RETX_FLASH.ld
+# Other chips: STM32F407VGTx_FLASH.ld, STM32F103C8Tx_FLASH.ld, etc.
 
 LDFLAGS := -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 \
            -specs=nano.specs -T$(LDSCRIPT) -Wl,--gc-sections \
            -Wl,-Map=firmware.map,--cref
 
 # ── Sources ─────────────────────────────────────────────────────────
-SRCS := main.c \
+SRCS := main_v3.c \
+        stm32f4xx_hal_msp.c \
+        $(CMSIS_DIR)/Device/ST/STM32F4xx/Source/Templates/system_stm32f4xx.c \
         $(HAL_DIR)/Src/stm32f4xx_hal.c \
         $(HAL_DIR)/Src/stm32f4xx_hal_uart.c \
         $(HAL_DIR)/Src/stm32f4xx_hal_tim.c \

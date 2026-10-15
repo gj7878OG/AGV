@@ -65,6 +65,9 @@ class TelemetryState:
     stm32_ack_age_ms: float = 0.0
     stm32_encoder_left: int = 0
     stm32_encoder_right: int = 0
+    stm32_encoder_delta_left: int = 0
+    stm32_encoder_delta_right: int = 0
+    stm32_firmware_version: str = ''
     camera_direction: str = 'UNAVAILABLE'
     camera_command: str = 'S'
     lidar_status: str = 'UNKNOWN'

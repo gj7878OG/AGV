@@ -12,3 +12,9 @@ __pycache__/
 # Local runtime artifacts
 *.log
 *.pid
+
+# STM32 firmware build output
+firmware/build/
+firmware/firmware.bin
+firmware/firmware.elf
+firmware/firmware.map
