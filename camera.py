@@ -206,22 +206,84 @@ def detect_yellow_centroid(
     min_area: int,
     kernel: tuple[int, int] = (5, 5),
 ) -> Optional[tuple[int, int, int]]:
-    """Return (cx, cy, area) of the largest yellow contour, or None."""
+    """Return (cx, cy, area) of the largest yellow contour, or None.
+
+    Multi-tier detection. Tries increasingly permissive colour ranges
+    so the line stays locked under different lighting and tape colours:
+
+      Tier 1: configured tight yellow range  (H ~20-35, saturated)
+      Tier 2: same hue, relaxed S/V          (catches washed-out tape)
+      Tier 3: wider warm range               (yellow → chartreuse)
+      Tier 4: orange + yellow + yellow-green (H 0-70)
+      Tier 5: green range                    (catches "yellow" tape that
+                                              the camera has rendered green
+                                              under bluish room lighting)
+
+    Tiers 3-5 prefer contours in the lower 2/3 of the frame (the floor)
+    unless the contour is very large (it's clearly the line wherever it is).
+    """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+    h, w = frame.shape[:2]
+    floor_top = h // 3   # below this Y is treated as "floor"
     k = np.ones(kernel, np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-    contour = max(contours, key=cv2.contourArea)
-    area = int(cv2.contourArea(contour))
-    if area < min_area:
-        return None
-    moments = cv2.moments(contour)
-    if moments['m00'] == 0:
-        return None
-    cx = int(moments['m10'] / moments['m00'])
-    cy = int(moments['m01'] / moments['m00'])
-    return cx, cy, area
+
+    def _scan(low_h: int, high_h: int, min_s: int, min_v: int,
+              min_area_override: Optional[int] = None
+    ) -> Optional[tuple[int, int, int]]:
+        mask = cv2.inRange(
+            hsv,
+            np.array((low_h, min_s, min_v)),
+            np.array((high_h, 255, 255)),
+        )
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        contour = max(contours, key=cv2.contourArea)
+        area = int(cv2.contourArea(contour))
+        threshold = min_area_override if min_area_override is not None else min_area
+        if area < threshold:
+            return None
+        moments = cv2.moments(contour)
+        if moments['m00'] == 0:
+            return None
+        cx = int(moments['m10'] / moments['m00'])
+        cy = int(moments['m01'] / moments['m00'])
+        return cx, cy, area
+
+    # Tier 1: configured range, anywhere in the frame
+    result = _scan(lower[0], upper[0], lower[1], lower[2])
+    if result is not None:
+        return result
+
+    # Tier 2: same hue, relaxed saturation/value
+    result = _scan(lower[0], upper[0], 50, 50)
+    if result is not None:
+        return result
+
+    # Tier 3: broader warm range — yellow-green / chartreuse
+    result = _scan(10, 45, 50, 50)
+    if result is not None:
+        cx, cy, area = result
+        if cy >= floor_top or area >= 4 * min_area:
+            return result
+
+    # Tier 4: orange → yellow → chartreuse (H 0-70, slightly stricter)
+    result = _scan(0, 70, 60, 60)
+    if result is not None:
+        cx, cy, area = result
+        if cy >= floor_top or area >= 8 * min_area:
+            return result
+
+    # Tier 5: GREEN range — last resort. Under very blue room lighting,
+    # a yellow tape can render as green-cyan. Catches the line even
+    # when the camera's white balance is fighting us.
+    # Require a high saturation so we don't pick up a green floor.
+    result = _scan(35, 90, 100, 80)
+    if result is not None:
+        cx, cy, area = result
+        if cy >= floor_top or area >= 6 * min_area:
+            return result
+
+    return None
